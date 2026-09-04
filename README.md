@@ -18,6 +18,7 @@ Model Inference Systems](https://arxiv.org/abs/2503.08415)
 - P2P and Mooncake-compatible KV transfer connectors.
 - Mooncake memory-store and SSD offload simulation with admission and LRU eviction.
 - Roofline latency modeling and an optional LLMCompass backend.
+- Decode-time hierarchical KV working-set fetch (GPU HBM / DRAM / SSD).
 
 ## Requirements
 
@@ -134,6 +135,8 @@ public release should also review the current configuration examples.
   trace-provided expert histograms, and result metrics.
 - [Mooncake](docs/mooncake.md): direct P2P transfer, shared memory/SSD stores,
   connector composition, configuration fields, and timing behavior.
+- [KV working-set offload](offload_sim.md): decode-time HBM / DRAM / SSD
+  hierarchy, fetch latency, CLI config, and comparison recipe.
 - [Parallelism](docs/parallelism.md): worker roles, TP/PP/DP/EP configuration,
   rank mapping, communication modeling, and configuration precedence.
 

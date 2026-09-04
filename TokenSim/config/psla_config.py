@@ -110,6 +110,16 @@ class LLMResult:
     mooncake_pool_keys: list[str] | None = None
     mooncake_offload_tiers: list[str] | None = None
     mooncake_offload_profiles: list[dict[str, Any]] | None = None
+    kv_ws_enabled: bool = False
+    kv_ws_placement: str = "sliding_window"
+    kv_ws_gpu_frac: float = 1.0
+    kv_ws_dram_frac: float = 0.0
+    kv_ws_ssd_frac: float = 0.0
+    kv_ws_fetch_latency: float = 0.0
+    kv_ws_dram_read_bytes: int = 0
+    kv_ws_ssd_read_bytes: int = 0
+    kv_ws_dram_read_tokens: int = 0
+    kv_ws_ssd_read_tokens: int = 0
 
     @classmethod
     def from_file(cls, filename):

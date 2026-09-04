@@ -2,6 +2,7 @@ from typing import Any
 
 from TokenSim.config.config import ParallelConfig, ParallelRankInfo
 from TokenSim.errors import ConfigurationError
+from TokenSim.kv_working_set.config import WorkingSetConfig
 from TokenSim.latency.base import LatencyBackend, backend_prefill_len
 from TokenSim.latency.llmcompass import LLMCompassLatencyBackend
 from TokenSim.latency.roofline import RooflineLatencyBackend
@@ -22,6 +23,8 @@ def build_latency_backend(
     expert_placement: ExpertPlacement | None = None,
     random_seed: int = 0,
     wrapped_llmcompass_vars: tuple[Any, Any, Any] | None = None,
+    working_set_config: WorkingSetConfig | None = None,
+    size_per_token: int = 0,
 ) -> LatencyBackend:
     roofline_backend = RooflineLatencyBackend(
         roofline=roofline,
@@ -33,6 +36,8 @@ def build_latency_backend(
         moe_config=moe_config,
         expert_placement=expert_placement,
         random_seed=random_seed,
+        working_set_config=working_set_config,
+        size_per_token=size_per_token,
     )
     if backend_type == "roofline":
         return roofline_backend

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, Any
 
 from TokenSim.config.psla_config import PSLAConfig, LLMResult, MetricData
 from TokenSim.config.config import ClusterConfig
+from TokenSim.kv_working_set.stats import WorkingSetStats
 from TokenSim.llm.llm_request import LLMTime, Request
 from TokenSim.moe.stats import MoEStats
 from TokenSim.mooncake.metrics import MooncakeStats
@@ -139,6 +140,28 @@ def get_mooncake_stats(engine: LLMEngine) -> dict[str, Any]:
     return aggregate.as_dict()
 
 
+def get_kv_working_set_stats(engine: LLMEngine) -> dict[str, Any]:
+    aggregate: WorkingSetStats | None = None
+    for worker in getattr(engine, "workers", []):
+        stats = _kv_ws_stats_from_backend(getattr(worker, "latency_backend", None))
+        if stats is None:
+            continue
+        aggregate = stats if aggregate is None else aggregate.aggregate(stats)
+    if aggregate is None:
+        config = getattr(engine, "working_set_config", None)
+        aggregate = WorkingSetStats.from_config(config)
+    return aggregate.as_dict()
+
+
+def _kv_ws_stats_from_backend(backend: Any) -> WorkingSetStats | None:
+    if backend is None:
+        return None
+    fallback = getattr(backend, "fallback_backend", None)
+    if fallback is not None:
+        return getattr(fallback, "kv_ws_stats", None)
+    return getattr(backend, "kv_ws_stats", None)
+
+
 def _flatten_connectors(connector: Any) -> list[Any]:
     if connector is None:
         return []
@@ -186,6 +209,7 @@ def print_all_stats(
     print_mooncake_stats(engine)
     print_parallel_stats(engine)
     print_moe_stats(engine)
+    print_kv_working_set_stats(engine)
     # Print SLO statistics.
     print_slo_stats(duration, g_time)
 
@@ -312,6 +336,22 @@ def print_moe_stats(engine: LLMEngine):
     )
 
 
+def print_kv_working_set_stats(engine: LLMEngine):
+    stats = get_kv_working_set_stats(engine)
+    if not stats.get("kv_ws_enabled"):
+        return
+    print(
+        "KV working set: "
+        + f"placement={stats.get('kv_ws_placement')}, "
+        + f"gpu_frac={stats.get('kv_ws_gpu_frac')}, "
+        + f"dram_frac={stats.get('kv_ws_dram_frac')}, "
+        + f"ssd_frac={stats.get('kv_ws_ssd_frac')}, "
+        + f"fetch_latency={stats.get('kv_ws_fetch_latency')}, "
+        + f"dram_read_bytes={stats.get('kv_ws_dram_read_bytes')}, "
+        + f"ssd_read_bytes={stats.get('kv_ws_ssd_read_bytes')}"
+    )
+
+
 def print_slo_stats(
     dur: float,
     timing: LLMTime,
@@ -378,6 +418,7 @@ def export_result(
     parallel_stats = get_parallel_stats(engine)
     moe_stats = get_moe_stats(engine)
     mooncake_stats = get_mooncake_stats(engine)
+    kv_ws_stats = get_kv_working_set_stats(engine)
 
     result = LLMResult(
         qps=args.qps,
@@ -404,6 +445,7 @@ def export_result(
         **parallel_stats,
         **moe_stats,
         **mooncake_stats,
+        **kv_ws_stats,
     )
 
     if args.results_path == "":

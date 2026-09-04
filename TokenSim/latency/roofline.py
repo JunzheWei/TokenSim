@@ -4,6 +4,9 @@ import copy
 from typing import Any
 
 from TokenSim.config.config import ParallelConfig, ParallelRankInfo, _GB
+from TokenSim.kv_working_set.config import WorkingSetConfig
+from TokenSim.kv_working_set.fetch import decode_fetch_for_requests
+from TokenSim.kv_working_set.stats import WorkingSetStats
 from TokenSim.latency.base import (
     DECODE_SCALE,
     PREFILL_OFFSET_SECONDS,
@@ -37,6 +40,8 @@ class RooflineLatencyBackend(LatencyBackend):
         moe_config: MoEModelConfig | None = None,
         expert_placement: ExpertPlacement | None = None,
         random_seed: int = 0,
+        working_set_config: WorkingSetConfig | None = None,
+        size_per_token: int = 0,
     ):
         self.roofline = roofline
         self.model = model
@@ -51,6 +56,9 @@ class RooflineLatencyBackend(LatencyBackend):
         self.expert_routing = ExpertRouting(self.moe_config, seed=random_seed)
         self._expert_to_rank: dict[int, int] | None = None
         self._roofline_cache: dict[tuple[int, int, int], tuple[float, float]] = {}
+        self.working_set_config = working_set_config
+        self.size_per_token = size_per_token
+        self.kv_ws_stats = WorkingSetStats.from_config(working_set_config)
         self.moe_stats = MoEStats(
             effective_moe_config=self.moe_config.to_dict(),
             expert_placement=(
@@ -119,7 +127,15 @@ class RooflineLatencyBackend(LatencyBackend):
         total_time += self._parallel_sync_latency(requests)
         if is_context_build:
             return total_time * PREFILL_SCALE + PREFILL_OFFSET_SECONDS
-        return total_time * DECODE_SCALE
+        return total_time * DECODE_SCALE + self.working_set_fetch_latency(requests)
+
+    def working_set_fetch_latency(self, requests: list[Request]) -> float:
+        config = self.working_set_config
+        if config is None or not config.enabled:
+            return 0.0
+        cost = decode_fetch_for_requests(requests, config, self.size_per_token)
+        self.kv_ws_stats.record_fetch(cost)
+        return cost.latency
 
     def _timebreakdown(
         self,

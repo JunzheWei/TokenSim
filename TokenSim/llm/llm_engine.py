@@ -26,6 +26,7 @@ from TokenSim.kv_transfer import (
     KVConnectorMetadata,
     P2PConnector,
 )
+from TokenSim.kv_working_set.config import WorkingSetConfig
 from TokenSim.latency import build_latency_backend
 from TokenSim.llm.llm_request import Request, RequestStatus
 from TokenSim.llm.llm_scheduler import (
@@ -160,6 +161,7 @@ class LLMWorker(Worker):
         latency_backend_type: str = "roofline",
         random_seed: int = 0,
         wrapped_llmcompass_vars: tuple[Any, Any, Any] | None = None,
+        working_set_config: WorkingSetConfig | None = None,
     ):
         super().__init__(env, id)
         self.roofline = roofline
@@ -225,6 +227,8 @@ class LLMWorker(Worker):
             expert_placement=self.expert_placement,
             random_seed=random_seed + id,
             wrapped_llmcompass_vars=wrapped_llmcompass_vars,
+            working_set_config=working_set_config,
+            size_per_token=self.cache_config.size_per_token,
         )
         self.owned_expert_ids = (
             self.expert_placement.experts_for_rank(self.rank_info)
@@ -413,6 +417,7 @@ class LLMEngine(Worker):
         wrapped_llmcompass_vars: tuple[Any, Any, Any] | None = None,
         random_seed: int = 0,
         debug_print: bool = False,
+        working_set_config: WorkingSetConfig | None = None,
     ):
         super().__init__(env, -1)
 
@@ -427,6 +432,7 @@ class LLMEngine(Worker):
         self.parallel_config = parallel_config or ParallelConfig.default()
         self.debug_printer = RequestCompletionDebugPrinter(debug_print)
         self.moe_config = psla_config.moe_config
+        self.working_set_config = working_set_config
         self.expert_placement = build_expert_placement(
             self.moe_config,
             self.parallel_config,
@@ -454,6 +460,7 @@ class LLMEngine(Worker):
                 latency_backend_type=latency_backend_type,
                 random_seed=random_seed,
                 wrapped_llmcompass_vars=wrapped_llmcompass_vars,
+                working_set_config=working_set_config,
             )
             for id, worker_config in enumerate(worker_configs)
         ]

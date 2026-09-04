@@ -18,6 +18,7 @@ from TokenSim.llm.llm_request import g_time, reset_g_time, Request
 from TokenSim.config.config import ClusterConfig, KVTransferConfig, ParallelConfig
 from TokenSim.config.psla_config import PSLAConfig
 from TokenSim.errors import ConfigurationError, SimulationStateError
+from TokenSim.kv_working_set.config import WorkingSetConfig
 from TransformerRoofline import TransformerRoofline
 
 
@@ -132,6 +133,11 @@ def main(args: argparse.Namespace):
         else None
     )
     kv_transfer_config = cluster.effective_kv_transfer(kv_transfer_override)
+    working_set_config = (
+        WorkingSetConfig.from_file(args.kv_working_set_config)
+        if args.kv_working_set_config
+        else None
+    )
     model_config = PSLAConfig.from_file(args.model_config_path).from_args(args)
     parallel_config = build_parallel_config(args, cluster, model_config)
     validate_moe_parallel_config(model_config, parallel_config)
@@ -165,6 +171,7 @@ def main(args: argparse.Namespace):
         wrapped_llmcompass_vars=wrapped_llmcompass_vars,
         random_seed=args.random_seed,
         debug_print=getattr(args, "debug_print", False),
+        working_set_config=working_set_config,
     )
     engine.validate_request_capacity(requests)
 
@@ -352,6 +359,12 @@ if __name__ == "__main__":
         type=str,
         default="roofline",
         help="Use 'roofline' or provide an LLMCompass architecture template path.",
+    )
+    parser.add_argument(
+        "--kv_working_set_config",
+        type=str,
+        default=None,
+        help="JSON config for decode-time hierarchical KV working-set fetch.",
     )
 
     args = parser.parse_args()

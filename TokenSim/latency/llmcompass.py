@@ -35,10 +35,16 @@ class LLMCompassLatencyBackend(LatencyBackend):
         ):
             return 0.0
         try:
-            return self._estimate_llmcompass(requests)
+            latency = self._estimate_llmcompass(requests)
         except Exception:
             logger.exception("LLMCompass failed; falling back to roofline")
             return self.fallback_backend.estimate_step_latency(requests)
+        is_context_build = requests[0].is_prefill or getattr(
+            requests[0], "needs_recompute", False
+        )
+        if not is_context_build:
+            latency += self.fallback_backend.working_set_fetch_latency(requests)
+        return latency
 
     def _estimate_llmcompass(self, requests: list[Request]) -> float:
         from LLMCompass.software_model.utils import Tensor, data_type_dict
