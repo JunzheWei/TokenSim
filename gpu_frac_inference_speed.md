@@ -5,7 +5,9 @@ Prefill / recompute charge **full** context on HBM. After those steps, decode oc
 
 Source: [`kv_working_set_test_report/gpu_frac_sweep/summary.json`](kv_working_set_test_report/gpu_frac_sweep/summary.json)
 
-Each `gpu_frac` has its own `λ*` (largest stable offered QPS: goodput ≥ 0.90 and TTFT p99 ≤ 3× light-load). Token/s and TPOT below are **at that knee**, not at a shared arrival rate. `N* = λ* × request_time.p50`. Peak B is the HBM occupancy ceiling, not Little's N*.
+Each `gpu_frac` has its own `λ*` — **swept, not a target**: the largest stable offered QPS (goodput ≥ 0.90 and TTFT p99 ≤ 3× light-load). Token/s and TPOT below are **at that knee**, not at a shared arrival rate. `N* = offered λ* × request_time.p50` is a Little **estimate** of average in-flight requests, not a scheduler count. Peak B is the HBM occupancy ceiling (513 blocks after 1% watermark on 518), not N*.
+
+`λ*` 不是预期到达率，是该 `gpu_frac` 还能稳住的最大到达率。`N*` 是 Little 估计，不是数出来的并发。
 
 **Peak B** (decode, S=1024) after watermark:
 
@@ -102,6 +104,55 @@ Prefill occupancy is full-context, so **B_prefill = 16** at S=512 for every `gpu
 Each row is at that `gpu_frac`'s own `λ*`. When `λ*` steps down (25% → 20%: 0.04 → 0.02), `N*` falls **9.01 → 1.02** and TPOT returns to light-load (~100 ms). Same pattern at 70% → 65% and 60% → 55%. This is not a faster decode at lower HBM occupancy.
 
 各行在各自膝点采集。`λ*` 降档后并发掉到 ~1，SSD 争用消失，TPOT 回落；不是留更少显存单步更快。
+
+---
+
+## 7. DRAM / SSD occupancy / DRAM 与 SSD 占用
+
+**极限容量** is Peak B occupancy (HBM packed, S=1024), not `N*`. Official 30/50/20: provision **32 GiB DRAM + 13 GiB SSD** for both MHA and GQA. See [`kv_working_set_test_report.md`](kv_working_set_test_report.md) §8 for the formula.
+
+| | MHA-64 Peak B | MHA DRAM | MHA SSD | GQA-8 Peak B | GQA DRAM | GQA SSD |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **30% (official)** | **25** | **31.25 GiB** | **12.51 GiB** | **205** | **32.03 GiB** | **12.83 GiB** |
+| 10% | 73 | 117.27 GiB | 47.05 GiB | 586 | 117.67 GiB | 47.21 GiB |
+
+GQA bytes/token are 1/8 but Peak B is ~8×, so host 极限几乎相同. `N*` columns below are Little estimates × a full S=1024 decode window (**upper bound**), not a measured watermark.
+
+The simulator does **not** cap DRAM or SSD. Host GiB are derived after decode trim (`S=1024`, `size_per_token = 2.50 MiB` here, remainder DRAM:SSD = 5:2):
+
+```text
+GiB = concurrency × tokens_tier × 2.50 / 1024
+```
+
+**Peak** columns: HBM packed to Peak B (occupancy ceiling). **N\*** columns: Little N* × full S=1024 window (upper bound, not measured occupancy).
+
+模拟器不限制 DRAM/SSD。Peak 列为 HBM 打满的极限；N* 列为 Little 上界。官方 30/50/20 极限 **31.25 + 12.51 GiB**。N* 上界 **7.96 + 3.19 GiB**。
+
+| gpu_frac | tokens (GPU/DRAM/SSD) | Peak B | Peak DRAM | Peak SSD | N* | N* DRAM | N* SSD |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100% | 1024 / 0 / 0 | 8 | 0 | 0 | 3.89 | 0 | 0 |
+| 95% | 972 / 36 / 16 | 8 | 0.70 | 0.31 | 3.91 | 0.34 | 0.15 |
+| 90% | 921 / 73 / 30 | 8 | 1.43 | 0.59 | 3.92 | 0.70 | 0.29 |
+| 85% | 870 / 109 / 45 | 9 | 2.40 | 0.99 | 3.28 | 0.87 | 0.36 |
+| 80% | 819 / 146 / 59 | 9 | 3.21 | 1.30 | 2.63 | 0.94 | 0.38 |
+| 75% | 768 / 182 / 74 | 10 | 4.44 | 1.81 | 3.20 | 1.42 | 0.58 |
+| 70% | 716 / 219 / 89 | 11 | 5.88 | 2.39 | 4.07 | 2.18 | 0.88 |
+| 65% | 665 / 256 / 103 | 12 | 7.50 | 3.02 | 2.92 | 1.82 | 0.73 |
+| 60% | 614 / 292 / 118 | 13 | 9.27 | 3.75 | 3.61 | 2.57 | 1.04 |
+| 55% | 563 / 329 / 132 | 14 | 11.25 | 4.51 | 1.72 | 1.38 | 0.55 |
+| 50% | 512 / 365 / 147 | 16 | 14.26 | 5.74 | 2.43 | 2.17 | 0.87 |
+| 45% | 460 / 402 / 162 | 17 | 16.68 | 6.72 | 2.87 | 2.82 | 1.14 |
+| 40% | 409 / 438 / 177 | 19 | 20.32 | 8.21 | 3.26 | 3.49 | 1.41 |
+| 35% | 358 / 475 / 191 | 22 | 25.51 | 10.26 | 4.13 | 4.79 | 1.93 |
+| **30%** | **307 / 512 / 205** | **25** | **31.25** | **12.51** | **6.37** | **7.96** | **3.19** |
+| 25% | 256 / 548 / 220 | 32 | 42.81 | 17.19 | 9.01 | 12.05 | 4.84 |
+| 20% | 204 / 585 / 235 | 39 | 55.70 | 22.38 | 1.02 | 1.46 | 0.59 |
+| 15% | 153 / 621 / 250 | 51 | 77.32 | 31.13 | 1.13 | 1.71 | 0.69 |
+| 10% | 102 / 658 / 264 | 73 | 117.27 | 47.05 | 1.29 | 2.07 | 0.83 |
+
+Units: GiB (`1024³`). 100 concurrent S=1024 at 30/50/20 would be **125.00 GiB DRAM + 50.05 GiB SSD** (test pile-up, not Peak B).
+
+Companion GQA occupancy: [`gqa_gpu_frac_inference_speed.md`](gqa_gpu_frac_inference_speed.md). Main report: [`kv_working_set_test_report.md`](kv_working_set_test_report.md) §8.
 
 ```bash
 python3.11 kv_working_set_test_report/gpu_frac_sweep/run_sweep.py

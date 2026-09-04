@@ -389,10 +389,8 @@ Reuse `data/clusters/1_h200/h1.json` + `data/psla/llama-70b.json` + `paged-attn`
    remove the same-card TTFT cliff from P/D fighting over HBM; decode nodes still
    pay per-step cold KV. Reuse `data/clusters/8_a100/p2d5.json` and
    `dispatch_prefill_to_decode`. Not run in the current 1×H200 official recipe.
-3. **GQA 对照:** `TransformerRoofline/hardware_models.json` already has
-   `LLaMa2-70B-GQA` (`Grouped_Num=8`). Official `LLaMa2-70B` is MHA-64
-   (~2.50 MiB/token); GQA-8 is ~1/8 the KV. Same 128KiB + layer-prefetch +
-   Poisson-knee recipe, do not change `data/psla/llama-70b.json` until then.
+3. **GQA 对照 (done):** `data/psla/llama-70b-gqa.json` → `LLaMa2-70B-GQA`.
+   Report: `gqa_working_set_test_report.md`. Keep `llama-70b.json` as MHA-64.
 4. **Placement:** importance / attention-score residency.
 5. **Traces:** per-step `(tier, tokens, bytes, latency)`.
 6. **Block table:** mark physical blocks with tier.

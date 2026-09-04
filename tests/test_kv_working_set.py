@@ -5,6 +5,7 @@ from dataclasses import fields
 from pathlib import Path
 
 from TokenSim.block.block_manager import BlockManager
+from TokenSim.config.cache_config import CacheConfig
 from TokenSim.config.psla_config import LLMResult
 from TokenSim.config.config import ParallelConfig
 from TokenSim.errors import ConfigurationError
@@ -34,6 +35,7 @@ from TokenSim.kv_working_set.stats import WorkingSetStats
 from TokenSim.latency import LLMCompassLatencyBackend, RooflineLatencyBackend
 from TokenSim.latency.base import DECODE_SCALE
 from TokenSim.llm.llm_request import Request
+from TransformerRoofline import TransformerRoofline
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -711,6 +713,24 @@ class WorkingSetSpillWriteTest(unittest.TestCase):
         self.assertAlmostEqual(payload["kv_ws_spill_latency"], cost.latency)
         self.assertEqual(payload["kv_ws_dram_write_bytes"], cost.dram_bytes)
         self.assertEqual(payload["kv_ws_ssd_write_bytes"], cost.ssd_bytes)
+
+
+class WorkingSetGqaCacheTest(unittest.TestCase):
+    def test_gqa_kv_is_one_eighth_of_mha(self):
+        roofline = TransformerRoofline(
+            str(REPO_ROOT / "TransformerRoofline/hardware_models.json"),
+            str(REPO_ROOT / "TransformerRoofline/allreduce_v100.xlsx"),
+            str(REPO_ROOT / "TransformerRoofline/hardware_elements.json"),
+        )
+        mha = CacheConfig(16, "H200", "LLaMa2-70B", roofline)
+        gqa = CacheConfig(16, "H200", "LLaMa2-70B-GQA", roofline)
+        self.assertEqual(mha.num_kv_heads, 64)
+        self.assertEqual(gqa.num_kv_heads, 8)
+        self.assertEqual(mha.size_per_token, 2_621_440)
+        self.assertEqual(gqa.size_per_token, mha.size_per_token // 8)
+        self.assertEqual(gqa.size_per_token, 327_680)
+        self.assertEqual(int(mha.num_gpu_blocks), 518)
+        self.assertEqual(int(gqa.num_gpu_blocks), 4144)
 
 
 if __name__ == "__main__":

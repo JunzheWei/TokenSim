@@ -5,15 +5,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+from TokenSim.config.cache_config import CacheConfig
 from TokenSim.kv_working_set.knee import little_concurrency, search_knee_qps
 from TokenSim.kv_working_set.placement import gpu_resident_blocks
+from TransformerRoofline import TransformerRoofline
 
 ROOT = Path(__file__).resolve().parents[1]
 CLUSTER = ROOT / "data/clusters/1_h200/h1.json"
 MODEL = ROOT / "data/psla/llama-70b.json"
 WATERMARK_BLOCKS = 5
 GPU_BLOCKS = 518
-AVAIL_GPU_BLOCKS = GPU_BLOCKS - WATERMARK_BLOCKS
 IO_SIZE_128K = 131072
 DRAM = {"read_latency_us": 2.0, "read_bw_gbps": 50.0}
 HBM = {"read_latency_us": 0.0, "read_bw_gbps": 2000.0}
@@ -33,11 +34,32 @@ SSD_SLC = {
 }
 
 
-def peak_b(gpu_frac: float, context: int = 1024, block_size: int = 16) -> int:
+def cache_gpu_blocks(model: str = "LLaMa2-70B", hardware: str = "H200") -> int:
+    roofline = TransformerRoofline(
+        str(ROOT / "TransformerRoofline/hardware_models.json"),
+        str(ROOT / "TransformerRoofline/allreduce_v100.xlsx"),
+        str(ROOT / "TransformerRoofline/hardware_elements.json"),
+    )
+    cfg = CacheConfig(16, hardware, model, roofline)
+    return int(cfg.num_gpu_blocks)
+
+
+def available_gpu_blocks(gpu_blocks: int | None = None) -> int:
+    n = GPU_BLOCKS if gpu_blocks is None else int(gpu_blocks)
+    return n - int(0.01 * n)
+
+
+def peak_b(
+    gpu_frac: float,
+    context: int = 1024,
+    block_size: int = 16,
+    *,
+    gpu_blocks: int | None = None,
+) -> int:
     blocks = gpu_resident_blocks(context, block_size, gpu_frac)
     if blocks <= 0:
         return 0
-    return AVAIL_GPU_BLOCKS // blocks
+    return available_gpu_blocks(gpu_blocks) // blocks
 
 
 def result_filename(qps: float) -> str:
@@ -48,6 +70,8 @@ def run_benchmark(
     results_dir: Path,
     qps: float,
     config_path: Path | None,
+    *,
+    model: Path | None = None,
 ) -> dict:
     results_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -62,7 +86,7 @@ def run_benchmark(
         "--cluster",
         str(CLUSTER),
         "--model",
-        str(MODEL),
+        str(model or MODEL),
         "--verbose",
         "none",
         "--results_path",
@@ -134,12 +158,15 @@ def find_config_knee(
     results_dir: Path,
     config_path: Path | None,
     extra: dict,
+    *,
+    model: Path | None = None,
+    gpu_blocks: int | None = None,
 ) -> dict:
     print(f"=== knee {tag} ===", flush=True)
 
     def evaluate(qps: float) -> dict:
         print(f"  qps={qps:g}", flush=True)
-        result = run_benchmark(results_dir, qps, config_path)
+        result = run_benchmark(results_dir, qps, config_path, model=model)
         return metrics_from_result(result, qps)
 
     qps_star, points = search_knee_qps(evaluate)
@@ -151,7 +178,7 @@ def find_config_knee(
         **knee,
         "qps_star": qps_star,
         "n_star": knee["little_n"],
-        "peak_b": peak_b(gpu_frac),
+        "peak_b": peak_b(gpu_frac, gpu_blocks=gpu_blocks),
         "curve": [
             {**points[q], "offered_qps": q, "stable": q <= qps_star + 1e-12}
             for q in sorted(points)
