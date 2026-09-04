@@ -25,3 +25,6 @@ class BlockTable:
 
     def pop_blocks(self, request_id: int) -> list[PhysicalTokenBlock]:
         return self._request_blocks.pop(request_id, [])
+
+    def set_blocks(self, request_id: int, blocks: list[PhysicalTokenBlock]) -> None:
+        self._request_blocks[request_id] = list(blocks)

@@ -124,8 +124,16 @@ class BlockManager:
     def _constrain_gpu_occupancy(self) -> bool:
         return self.gpu_frac < 1.0
 
+    def _occupancy_frac(self, req: Request) -> float:
+        """Prefill/recompute keep the full context on HBM; decode uses gpu_frac."""
+        if req.is_prefill or getattr(req, "needs_recompute", False):
+            return 1.0
+        return self.gpu_frac
+
     def _gpu_target_blocks(self, req: Request) -> int:
-        return gpu_resident_blocks(req.context_len, self.block_size, self.gpu_frac)
+        return gpu_resident_blocks(
+            req.context_len, self.block_size, self._occupancy_frac(req)
+        )
 
     def can_allocate(self, req: Request) -> bool:
         if self._constrain_gpu_occupancy():
@@ -193,6 +201,24 @@ class BlockManager:
         if self._constrain_gpu_occupancy():
             return self._gpu_target_blocks(req)
         return req.num_logical_token_blocks
+
+    def trim_to_gpu_target(self, req: Request) -> int:
+        """Free oldest GPU blocks down to decode ``gpu_frac``. Spill I/O is not charged."""
+        if not self._constrain_gpu_occupancy():
+            return 0
+        if req.is_prefill or getattr(req, "needs_recompute", False):
+            return 0
+        target = self._gpu_target_blocks(req)
+        blocks = self.block_table.get_blocks(req.id)
+        if len(blocks) <= target:
+            return 0
+        spill = blocks[: len(blocks) - target]
+        keep = blocks[len(blocks) - target :]
+        for block in spill:
+            self._free_block(block)
+        self.block_table.set_blocks(req.id, keep)
+        self._sync_request_blocks(req, keep)
+        return len(spill)
 
     def can_append_slot(self, req: Request, reserved_blocks: int = 0) -> bool:
         required_blocks = int(

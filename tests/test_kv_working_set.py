@@ -58,7 +58,6 @@ class _LatencyRequest:
         self.prefill_len = prefill_len
         self.generation_idx = generation_idx
         self.is_prefill = is_prefill
-        self.kv_ws_fetched_end = 0
         self.prefill_compute_len = prefill_len
         self.needs_recompute = needs_recompute
         self.recompute_tokens = recompute_tokens
@@ -219,24 +218,21 @@ class WorkingSetPlacementTest(unittest.TestCase):
         self.assertEqual(cost.ssd_tokens, 0)
         self.assertEqual(cost.latency, 0.0)
 
-    def test_second_decode_only_faults_new_storage_tokens(self):
-        config = _hier_config()
-        first = fetch_cost(100, config, SIZE_PER_TOKEN, fetched_end=0)
-        self.assertEqual((first.dram_tokens, first.ssd_tokens), (50, 20))
-        self.assertEqual(first.next_fetched_end, 70)
-        second = fetch_cost(101, config, SIZE_PER_TOKEN, fetched_end=first.next_fetched_end)
-        self.assertEqual(second.ssd_tokens, 0)
-        self.assertEqual(second.dram_tokens, 1)
-        self.assertEqual(second.next_fetched_end, 71)
-        self.assertLess(second.latency, first.latency)
-
-    def test_repeat_fetch_at_same_s_is_zero(self):
+    def test_every_decode_rereads_full_cold_set(self):
         config = _hier_config()
         first = fetch_cost(100, config, SIZE_PER_TOKEN)
-        again = fetch_cost(100, config, SIZE_PER_TOKEN, fetched_end=first.next_fetched_end)
-        self.assertEqual(again.latency, 0.0)
-        self.assertEqual(again.dram_tokens, 0)
-        self.assertEqual(again.ssd_tokens, 0)
+        self.assertEqual((first.dram_tokens, first.ssd_tokens), (50, 20))
+        second = fetch_cost(101, config, SIZE_PER_TOKEN)
+        self.assertEqual((second.dram_tokens, second.ssd_tokens), (50, 21))
+        self.assertGreater(second.latency, first.latency)
+
+    def test_repeat_fetch_at_same_s_charges_again(self):
+        config = _hier_config()
+        first = fetch_cost(100, config, SIZE_PER_TOKEN)
+        again = fetch_cost(100, config, SIZE_PER_TOKEN)
+        self.assertAlmostEqual(again.latency, first.latency)
+        self.assertEqual(again.dram_tokens, first.dram_tokens)
+        self.assertEqual(again.ssd_tokens, first.ssd_tokens)
 
     def test_coalesced_io_size_matches_old_formula(self):
         config = _hier_config()
@@ -383,7 +379,7 @@ class WorkingSetLatencyBackendTest(unittest.TestCase):
         expected_fetch = fetch_cost(100, config, SIZE_PER_TOKEN).latency
         self.assertAlmostEqual(observed, 0.05 + expected_fetch)
 
-    def test_second_backend_step_only_faults_window_slide(self):
+    def test_second_backend_step_rereads_full_cold_set(self):
         request = _decode_request(prefill_len=99, generation_idx=1)
         config = _hier_config()
         hierarchical = RooflineLatencyBackend(
@@ -402,18 +398,22 @@ class WorkingSetLatencyBackendTest(unittest.TestCase):
         )
         hierarchical.estimate_step_latency([request])
         dram_after_first = hierarchical.kv_ws_stats.kv_ws_dram_read_tokens
+        ssd_after_first = hierarchical.kv_ws_stats.kv_ws_ssd_read_tokens
         request.generation_idx = 2
         baseline = disabled.estimate_step_latency(
             [_decode_request(prefill_len=99, generation_idx=2)]
         )
         observed = hierarchical.estimate_step_latency([request])
-        slide = fetch_cost(101, config, SIZE_PER_TOKEN, fetched_end=70)
-        self.assertEqual(slide.dram_tokens, 1)
-        self.assertEqual(slide.ssd_tokens, 0)
-        self.assertAlmostEqual(observed, baseline + slide.latency)
+        full = fetch_cost(101, config, SIZE_PER_TOKEN)
+        self.assertEqual((full.dram_tokens, full.ssd_tokens), (50, 21))
+        self.assertAlmostEqual(observed, baseline + full.latency)
         self.assertEqual(
             hierarchical.kv_ws_stats.kv_ws_dram_read_tokens,
-            dram_after_first + 1,
+            dram_after_first + full.dram_tokens,
+        )
+        self.assertEqual(
+            hierarchical.kv_ws_stats.kv_ws_ssd_read_tokens,
+            ssd_after_first + full.ssd_tokens,
         )
 
     def test_decode_scale_is_not_applied_to_fetch(self):
@@ -527,33 +527,44 @@ class WorkingSetGpuOccupancyTest(unittest.TestCase):
         self.assertEqual(gpu_resident_blocks(1024, 16, 1.0), 64)
         self.assertEqual(gpu_resident_blocks(512, 16, 0.1), 4)
 
-    def test_half_frac_fits_twice_as_many_requests(self):
-        def make_req(req_id: int) -> Request:
-            return Request(id=req_id, prefill_len=32, decode_len=1, block_size=16)
-
-        full = BlockManager(
-            block_size=16, num_gpu_blocks=4, num_cpu_blocks=8, gpu_frac=1.0
-        )
+    def test_prefill_allocates_full_context_regardless_of_gpu_frac(self):
         half = BlockManager(
-            block_size=16, num_gpu_blocks=4, num_cpu_blocks=8, gpu_frac=0.5
+            block_size=16, num_gpu_blocks=8, num_cpu_blocks=8, gpu_frac=0.5, watermark=0
         )
-        full_fit = 0
-        while True:
-            req = make_req(full_fit)
-            if not full.can_allocate(req):
-                break
-            full.allocate(req)
-            full_fit += 1
-        half_fit = 0
-        while True:
-            req = make_req(100 + half_fit)
+        req = Request(id=1, prefill_len=32, decode_len=16, block_size=16)
+        self.assertTrue(half.can_allocate(req))
+        half.allocate(req)
+        self.assertEqual(half.block_table.get_num_blocks(1), 2)
+
+    def test_trim_after_prefill_keeps_newest_gpu_frac_blocks(self):
+        mgr = BlockManager(
+            block_size=16, num_gpu_blocks=8, num_cpu_blocks=8, gpu_frac=0.5, watermark=0
+        )
+        req = Request(id=1, prefill_len=64, decode_len=16, block_size=16)
+        mgr.allocate(req)
+        self.assertEqual(mgr.block_table.get_num_blocks(1), 4)
+        req.generation_idx = 1
+        spilled = mgr.trim_to_gpu_target(req)
+        target = gpu_resident_blocks(req.context_len, 16, 0.5)
+        self.assertEqual(target, 2)
+        self.assertEqual(spilled, 2)
+        self.assertEqual(mgr.block_table.get_num_blocks(1), 2)
+
+    def test_decode_gpu_frac_admits_more_after_trim(self):
+        half = BlockManager(
+            block_size=16, num_gpu_blocks=4, num_cpu_blocks=8, gpu_frac=0.5, watermark=0
+        )
+        fitted = []
+        for req_id in range(10):
+            req = Request(id=req_id, prefill_len=32, decode_len=1, block_size=16)
             if not half.can_allocate(req):
                 break
             half.allocate(req)
-            half_fit += 1
-        self.assertEqual(full_fit, 2)
-        self.assertEqual(half_fit, 4)
-        self.assertEqual(half.block_table.get_num_blocks(100), 1)
+            req.generation_idx = 1
+            half.trim_to_gpu_target(req)
+            fitted.append(req)
+        self.assertEqual(len(fitted), 3)
+        self.assertEqual(half.block_table.get_num_blocks(0), 1)
 
 
 if __name__ == "__main__":

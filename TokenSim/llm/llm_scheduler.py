@@ -330,6 +330,7 @@ class LLMPagedAttnScheduler(LLMScheduler):
         for req in requests:
             self.block_manager.commit_input_cache(req)
             req.finish_recompute(latency)
+            self.block_manager.trim_to_gpu_target(req)
 
     def release_reserved_blocks(self, num_blocks: int | None = None):
         self.block_manager.release_reserved_blocks(num_blocks)

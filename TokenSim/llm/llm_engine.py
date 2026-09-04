@@ -285,6 +285,14 @@ class LLMWorker(Worker):
             request.step(self.env, latency, len(requests))
             if was_prefill:
                 self.engine.record_request_completion("prefill", request)
+                scheduler = getattr(self, "scheduler", None)
+                block_manager = (
+                    getattr(scheduler, "block_manager", None)
+                    if scheduler is not None
+                    else None
+                )
+                if block_manager is not None and not request.is_done:
+                    block_manager.trim_to_gpu_target(request)
             if request.is_done:
                 self.engine.record_request_completion("decode", request)
 
@@ -503,14 +511,15 @@ class LLMEngine(Worker):
 
     def validate_request_capacity(self, requests: list[Request]) -> None:
         gpu_frac = 1.0
-        if self.working_set_config is not None and self.working_set_config.enabled:
-            gpu_frac = self.working_set_config.gpu_frac
+        working_set_config = getattr(self, "working_set_config", None)
+        if working_set_config is not None and working_set_config.enabled:
+            gpu_frac = working_set_config.gpu_frac
         role_pools = (
             (
                 "prefill",
                 self.prefill_workers.workers,
                 lambda req: gpu_resident_blocks(
-                    req.prefill_len, req.block_size, gpu_frac
+                    req.prefill_len, req.block_size, 1.0
                 ),
             ),
             (

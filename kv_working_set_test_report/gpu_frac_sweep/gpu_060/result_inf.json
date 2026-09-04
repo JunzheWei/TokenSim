@@ -223,30 +223,30 @@
     ],
     "batching": "paged-attn",
     "request_time": {
-        "p50": 121.60093399975212,
-        "p99": 232.7613946453578,
-        "max": 233.11870383502165
+        "p50": 1054.6473090353197,
+        "p99": 1954.2775277941757,
+        "max": 1954.382762460648
     },
     "prefill_time": {
-        "p50": 80.38991268667662,
-        "p99": 196.80122065588438,
-        "max": 197.1400173894513
+        "p50": 676.9320256884963,
+        "p99": 1666.6683436199082,
+        "max": 1668.016555056882
     },
     "decode_time": {
-        "p50": 0.07664842871288341,
-        "p99": 0.1479068022994246,
-        "max": 0.1511500770302012
+        "p50": 0.6518002716750655,
+        "p99": 1.2434418115297399,
+        "max": 1.273935226529848
     },
-    "duration": 233.11870383502165,
-    "output_qps": 0.4289660089684185,
-    "output_token_ps": 439.48425550832417,
+    "duration": 1954.382762460648,
+    "output_qps": 0.05116704973088071,
+    "output_token_ps": 52.42166579028191,
     "notdone": [],
-    "preemption_count": 64,
-    "recomputation_count": 64,
-    "recomputed_tokens": 41918,
-    "recompute_service_time": 8.487958328842694,
-    "simulator_wall_time": 0.6854457190001995,
-    "simulated_time": 233.11870383502165,
+    "preemption_count": 37,
+    "recomputation_count": 37,
+    "recomputed_tokens": 24285,
+    "recompute_service_time": 3.4539994332244626,
+    "simulator_wall_time": 0.7991927120001492,
+    "simulated_time": 1954.382762460648,
     "reuse_hit_blocks": 0,
     "reuse_miss_blocks": 0,
     "reuse_hit_tokens": 0,
@@ -372,11 +372,11 @@
     "kv_ws_gpu_frac": 0.6,
     "kv_ws_dram_frac": 0.28571428571428575,
     "kv_ws_ssd_frac": 0.11428571428571427,
-    "kv_ws_fetch_latency": 3.2980390156251675,
-    "kv_ws_dram_read_bytes": 91847393280,
-    "kv_ws_ssd_read_bytes": 15589703680,
-    "kv_ws_dram_read_tokens": 35037,
-    "kv_ws_ssd_read_tokens": 5947,
-    "kv_ws_dram_ios": 20514,
-    "kv_ws_ssd_ios": 3806080
+    "kv_ws_fetch_latency": 1725.9699426250013,
+    "kv_ws_dram_read_bytes": 29375584010240,
+    "kv_ws_ssd_read_bytes": 11884245811200,
+    "kv_ws_dram_read_tokens": 11205896,
+    "kv_ws_ssd_read_tokens": 4533480,
+    "kv_ws_dram_ios": 51126,
+    "kv_ws_ssd_ios": 2901427200
 }

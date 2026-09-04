@@ -1,27 +1,27 @@
-request_time=MetricData(p50=103.47312378057106, p99=151.54284165241393, max=152.13823749092575)
-prefill_time=MetricData(p50=2.938583562751681, p99=108.50618449059489, max=108.50618449059489)
-decode_time=MetricData(p50=0.09919974168715187, p99=0.19581229438119735, max=0.1992990234853901)
-decode_max_time=MetricData(p50=6.190688873638269, p99=43.9417865174661, max=44.530239712596554)
-prefill_idle_time=MetricData(p50=0.0, p99=0.9992670284829434, max=0.9992902475417259)
-decode_idle_time=MetricData(p50=0.052893334618155874, p99=0.4724718224954238, max=0.4797026402006076)
-Average prefill latency: 43.49083138854755
-Max prefill latency: 108.50618449059489
-Min prefill latency: 2.938583562751681
-Average decode latency: 0.1121299919784891
-Max decode latency: 0.1992990234853901
-Min decode latency: 0.08165207412227726
-total time: 152.13823749092575
-Thoughput: 0.657296953410312 r/s, 336.7069373539664 token/s
-Total preemptions: 46
+request_time=MetricData(p50=6275.293952753102, p99=9311.553818604809, max=9313.912364880176)
+prefill_time=MetricData(p50=3224.7754061032415, p99=6356.78281813352, max=6356.862704605223)
+decode_time=MetricData(p50=6.151298165486169, p99=11.951541913942428, max=12.079593210350662)
+decode_max_time=MetricData(p50=7.387470225762675, p99=3020.3521087286827, max=3056.9640610404463)
+prefill_idle_time=MetricData(p50=0.9999749985402335, p99=0.9999894808079257, max=0.9999895294100963)
+decode_idle_time=MetricData(p50=0.0008738231844226396, p99=0.4920600775369591, max=0.49755594931813474)
+Average prefill latency: 2602.45198789544
+Max prefill latency: 6356.862704605223
+Min prefill latency: 0.8706322913152994
+Average decode latency: 6.84966890771651
+Max decode latency: 12.079593210350662
+Min decode latency: 5.500091687207381
+total time: 9313.912364880176
+Thoughput: 0.010736626680863826 r/s, 5.499944383539304 token/s
+Total preemptions: 26
 Prefix cache: hit_blocks=0, miss_blocks=0, hit_tokens=0, effective_prefill_tokens=51226, hit_rate=0
 KV connector: transfers=0, blocks=0, bytes=0, latency=0.0, load_wait=0.0, save_wait=0.0
 Parallel: config={'tensor_parallel_size': 1, 'pipeline_parallel_size': 1, 'data_parallel_size': 1, 'data_parallel_rank': 0, 'data_parallel_size_local': 1, 'tensor_parallel_collective_latency_scale': 1.0, 'pipeline_parallel_activation_latency_scale': 1.0, 'enable_expert_parallel': False, 'expert_placement_strategy': 'linear', 'all2all_backend': 'allgather_reducescatter'}, ranks=1/1, dp_placements={}, sync_events=0, sync_latency=0.0
 MoE: disabled
-KV working set: placement=sliding_window, gpu_frac=0.3, dram_frac=0.5, ssd_frac=0.2, fetch_latency=13.819158093750069, dram_read_bytes=160846315520, ssd_read_bytes=27100446720, dram_ios=35821, ssd_ios=6616320
-Prefill SLO Good Throughput: 51 r, 0.3352214462392591 r/s
+KV working set: placement=sliding_window, gpu_frac=0.3, dram_frac=0.5, ssd_frac=0.2, fetch_latency=9169.96022504689, dram_read_bytes=51474236702720, ssd_read_bytes=20696963481600, dram_ios=51126, ssd_ios=5052969600
+Prefill SLO Good Throughput: 49 r, 0.005260947073623275 r/s
 Max-Decode SLO Good Throughput: 0 r, 0.0 r/s
 Prefill and Max-Decode SLO Good Throughput: 0 r, 0.0 r/s
-Decode SLO Good Throughput: 83 r, 0.545556471330559 r/s
-Prefill and Decode SLO Good Throughput: 34 r, 0.22348096415950608 r/s
+Decode SLO Good Throughput: 0 r, 0.0 r/s
+Prefill and Decode SLO Good Throughput: 0 r, 0.0 r/s
 /home/kewei/.local/lib/python3.11/site-packages/simpy/__init__.py:11: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
   from pkg_resources import get_distribution

@@ -185,7 +185,7 @@ def plot_official(all_gpu: dict, hier: dict) -> None:
     ax.bar(labels, ratios, color="#4c78a8")
     ax.axhline(1.0, color="#333", linewidth=1)
     ax.set_ylabel("hierarchical / all-GPU")
-    ax.set_title("Official burst slowdown (occupancy + SLC 4K)")
+    ax.set_title("Official burst slowdown (per-step cold-set fetch + SLC 4K)")
     fig.savefig(REPORT / "fig_slowdown.png", dpi=160, bbox_inches="tight")
     plt.close(fig)
 

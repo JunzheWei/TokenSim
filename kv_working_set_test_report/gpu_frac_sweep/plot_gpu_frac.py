@@ -50,7 +50,7 @@ def main() -> None:
     tpot_ms = [r["tpot_p50"] * 1e3 for r in rows]
     ttft = [r["ttft_p50"] for r in rows]
     b_dec = [peak_b(r["gpu_frac"], 1024) for r in rows]
-    b_pre = [peak_b(r["gpu_frac"], 512) for r in rows]
+    b_pre = [peak_b(1.0, 512) for _ in rows]
     fetch = [r["kv_ws_fetch_latency"] for r in rows]
 
     plt.rcParams.update(
@@ -68,7 +68,7 @@ def main() -> None:
 
     # --- Figure 1: token/s with peak-B plateaus ---
     fig, ax = plt.subplots(figsize=(11.2, 5.6))
-    ax.set_ylim(240, 1160)
+    ax.set_ylim(0, 320)
     cmap = plt.cm.Blues
     unique_b = sorted(set(b_dec))
     b_to_color = {
@@ -112,7 +112,7 @@ def main() -> None:
     ax.set_xlabel("GPU KV fraction (gpu_frac)")
     ax.set_ylabel("System token/s")
     ax.set_title(
-        "System token/s vs GPU KV fraction — plateaus follow peak B\n"
+        "System token/s vs GPU KV fraction — per-step cold-set I/O\n"
         "Peak B = 513 GPU blocks / ceil(floor(1024 × gpu_frac) / 16)"
     )
     ax.set_xticks(pcts)
@@ -151,7 +151,7 @@ def main() -> None:
     cbar.set_label("gpu_frac (%)")
     ax.set_xlabel("Peak B at S=1024")
     ax.set_ylabel("System token/s")
-    ax.set_title("System token/s tracks peak B (sublinear: TPOT also rises)")
+    ax.set_title("System token/s vs peak B (token/s falls as more KV is off-GPU)")
     fig.tight_layout()
     fig.savefig(HERE / "fig_tokens_vs_peak_b.png", dpi=160, bbox_inches="tight")
     plt.close(fig)
@@ -164,14 +164,14 @@ def main() -> None:
     axes[0].set_xticklabels([f"{p}%" for p in pcts], rotation=45, ha="right")
     axes[0].set_xlabel("GPU KV fraction")
     axes[0].set_ylabel("TTFT p50 (s)")
-    axes[0].set_title("TTFT p50 falls as more requests admit together")
+    axes[0].set_title("TTFT p50 (queue wait + prefill; cliff below 30%)")
     axes[1].plot(pcts, tpot_ms, color="#c45c26", marker="o", linewidth=2)
     axes[1].set_xlim(103, 7)
     axes[1].set_xticks(pcts)
     axes[1].set_xticklabels([f"{p}%" for p in pcts], rotation=45, ha="right")
     axes[1].set_xlabel("GPU KV fraction")
     axes[1].set_ylabel("TPOT p50 (ms)")
-    axes[1].set_title("TPOT p50 rises with larger decode batches")
+    axes[1].set_title("TPOT p50 rises as each decode re-reads a larger cold set")
     fig.tight_layout()
     fig.savefig(HERE / "fig_ttft_tpot_frac.png", dpi=160, bbox_inches="tight")
     plt.close(fig)
@@ -185,7 +185,7 @@ def main() -> None:
     ax.set_xticklabels([f"{p}%" for p in pcts], rotation=45, ha="right")
     ax.set_xlabel("GPU KV fraction")
     ax.set_ylabel("Peak concurrent requests")
-    ax.set_title("Prefill vs decode peak B — 90% raises B_pre 16→17 while B_dec stays 8")
+    ax.set_title("Prefill vs decode peak B — prefill stays full-context (B=16 at S=512)")
     ax.legend(loc="upper left")
     fig.tight_layout()
     fig.savefig(HERE / "fig_peak_b_prefill_decode.png", dpi=160, bbox_inches="tight")

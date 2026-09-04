@@ -22,7 +22,6 @@ class FetchCost:
     dram_bytes: int
     ssd_bytes: int
     split: ContextSplit
-    next_fetched_end: int = 0
     dram_ios: int = 0
     ssd_ios: int = 0
 
@@ -103,17 +102,16 @@ def fetch_cost(
     context_len: int,
     config: WorkingSetConfig,
     size_per_token: int,
-    fetched_end: int = 0,
 ) -> FetchCost:
-    """Charge DRAM/SSD reads only for tokens not yet faulted in.
+    """Charge DRAM/SSD reads for the whole cold set ``[0, gpu_start)``.
 
-    Storage covers ``[0, gpu_start)``. Tokens in ``[0, fetched_end)`` already
-    paid I/O. Later decode steps only pay for the window sliding into storage.
+    Full attention needs every historical K/V each decode step. Tokens not in
+    the GPU window stay on DRAM/SSD, so this range is I/O every step — not a
+    once-per-request page-in.
     """
     split = split_context(context_len, config)
     size_per_token = max(0, int(size_per_token))
-    fetched_end = max(0, int(fetched_end))
-    miss_start = min(fetched_end, split.gpu_start)
+    miss_start = 0
     miss_end = split.gpu_start
     dram_tokens = _overlap(miss_start, miss_end, split.dram_start, split.gpu_start)
     ssd_tokens = _overlap(miss_start, miss_end, split.ssd_start, split.dram_start)
@@ -132,7 +130,6 @@ def fetch_cost(
         dram_bytes=dram_bytes,
         ssd_bytes=ssd_bytes,
         split=split,
-        next_fetched_end=max(fetched_end, split.gpu_start),
         dram_ios=dram_ios,
         ssd_ios=ssd_ios,
     )
@@ -143,7 +140,7 @@ def decode_fetch_for_requests(
     config: WorkingSetConfig,
     size_per_token: int,
 ) -> FetchCost:
-    """Page-fault decode reads; share the SSD/DRAM queue when io_size > 0."""
+    """Per-step cold-set decode reads; share the SSD/DRAM queue when io_size > 0."""
     total = FetchCost(
         latency=0.0,
         dram_tokens=0,
@@ -163,14 +160,11 @@ def decode_fetch_for_requests(
     dram_independent = 0.0
     ssd_independent = 0.0
     last_split = total.split
-    last_fetched = 0
     for req in requests:
         if getattr(req, "is_prefill", False) or getattr(req, "needs_recompute", False):
             continue
         context_len = getattr(req, "prefill_len", 0) + getattr(req, "generation_idx", 0)
-        fetched_end = int(getattr(req, "kv_ws_fetched_end", 0) or 0)
-        cost = fetch_cost(context_len, config, size_per_token, fetched_end)
-        setattr(req, "kv_ws_fetched_end", cost.next_fetched_end)
+        cost = fetch_cost(context_len, config, size_per_token)
         dram_independent += media_access_latency(cost.dram_bytes, config.dram)
         ssd_independent += media_access_latency(cost.ssd_bytes, config.ssd)
         dram_tokens += cost.dram_tokens
@@ -180,7 +174,6 @@ def decode_fetch_for_requests(
         dram_ios += cost.dram_ios
         ssd_ios += cost.ssd_ios
         last_split = cost.split
-        last_fetched = cost.next_fetched_end
     dram_q = config.dram is not None and config.dram.queueing_enabled()
     ssd_q = config.ssd is not None and config.ssd.queueing_enabled()
     t_dram = (
@@ -198,7 +191,6 @@ def decode_fetch_for_requests(
         dram_bytes=dram_bytes,
         ssd_bytes=ssd_bytes,
         split=last_split,
-        next_fetched_end=last_fetched,
         dram_ios=dram_ios,
         ssd_ios=ssd_ios,
     )

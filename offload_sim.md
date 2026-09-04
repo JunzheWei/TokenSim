@@ -45,7 +45,7 @@ TokenSim 对 (1) 和 Mooncake 式 **prefix 归档**（给后续请求复用）�
 | --- | --- | --- |
 | Roofline / LLMCompass decode | Assumes **all KV on HBM** / 假定 KV 全在 HBM | Need additive `T_fetch` / 需要叠加读取时延 |
 | GPU full / 显存满 | `can_append_slot` fails → preempt + recompute | Baseline when `gpu_frac=1` / `gpu_frac=1` 时作对照 |
-| GPU occupancy / 占用 | `gpu_frac<1` charges `floor(S*gpu_frac)` GPU tokens | More concurrency; DRAM/SSD capacity infinite |
+| GPU occupancy / 占用 | Prefill/recompute charge full context; decode charges `floor(S*gpu_frac)` after trim | More decode concurrency; DRAM/SSD capacity infinite |
 | Mooncake store SSD | Prefill **prefix archive** / prefill 归档给后人 | **Orthogonal** / 正交，不要混用 |
 | CPU `BlockAllocator` | Allocated but unused on decode append | Not DRAM capacity / 不作 DRAM 容量 |
 
@@ -147,19 +147,19 @@ GPU 比例走现有 roofline，v1 不再单独加 HBM 读取。配置里的 `hbm
 
 ### 3.4 Step latency / 单步时延
 
-v1 uses **blocking** overlap and **page-fault fetch** / v1 阻塞叠加 + **缺页读取**:
+v1 uses **blocking** overlap and **per-step cold-set fetch** / v1 阻塞叠加 + **每步读冷 KV**:
 
 ```text
-T_fetch = T(dram_miss) + T(ssd_miss)   # only tokens not yet faulted in
+T_fetch = T(dram) + T(ssd)   # entire [0, S_gpu_start) every decode step
 T_step  = T_roofline_decode + T_fetch
 ```
 
-Storage covers ``[0, S_gpu_start)``. The first decode step faults that range
-once; later steps only pay for tokens that newly slide off GPU. Prefill KV is
-not pre-marked resident, so the first decode still page-ins the cold tail.
+Full attention needs every historical K/V each decode step. GPU keeps only the
+newest ``gpu_frac`` of the context, so ``[0, S_gpu_start)`` is read from
+DRAM/SSD **every** decode token. This is not a once-per-request page-in.
 
-存储区是 ``[0, S_gpu_start)``。第一次 decode 把这段缺页读入并记下水位；之后只为
-新滑出 GPU 的 token 付 I/O。Prefill 不算已命中，所以第一次 decode 仍会把冷尾读进来。
+全注意力每步都要碰全部历史 K/V。GPU 只留最新 ``gpu_frac``，因此
+``[0, S_gpu_start)`` **每个 decode token 都要从 DRAM/SSD 读一遍**。
 
 `T_roofline_decode` is the existing decode-branch result of
 `RooflineLatencyBackend.estimate_step_latency` (after `DECODE_SCALE`).
@@ -167,8 +167,12 @@ not pre-marked resident, so the first decode still page-ins the cold tail.
 
 Notes / 说明:
 
-- Prefill and recompute stay all-GPU **for latency** in v1 (no fetch). Prefill / 重算时延仍全 GPU。
-  GPU **occupancy** still follows `gpu_frac` so offloaded tokens do not consume HBM blocks.
+- Prefill and recompute stay all-GPU **for latency** (no fetch) **and occupancy**
+  (full prompt / rebuilt context on HBM). After those steps, GPU blocks are
+  trimmed to ``gpu_frac``; spill **writes** are not charged. Prefill / 重算时延
+  与占位都按全量 GPU；结束后把块裁到 ``gpu_frac``，写回不计。
+- Preemption is **recompute**, not swap: drop GPU KV and rebuild with compute.
+  Recompute pays GPU time, not DRAM/SSD I/O. 抢占走重算，不走 KV swap。
 - v1 does **not** subtract off-GPU KV from HBM attention in the roofline
   (pessimistic double-count). Phase 2 再从 HBM attention 里扣掉不在 GPU 的流量。
 - Spill / write-back is phase 2. 新 token 把旧块挤出 GPU 的写回是 phase 2。
@@ -341,8 +345,9 @@ Reuse `data/clusters/1_h200/h1.json` + `data/psla/llama-70b.json` + `paged-attn`
 | `qd_cap=8` vs `512` | smaller cap → larger `T` on the same miss |
 | SLC/MLC/N3 at `qd_cap=32` | `T(13) < T(18) < T(50)` |
 | `gpu_frac=1` vs disabled | identical decode step latency |
-| Hierarchical vs disabled | decode latency += accumulated `T_fetch` |
-| Prefill / recompute | no fetch addend |
+| Hierarchical vs disabled | decode latency += full-cold-set `T_fetch` |
+| Prefill / recompute | no fetch addend; full GPU occupancy then trim |
+| Second decode step | rereads the whole ``[0, gpu_start)``, not a watermark miss |
 
 ---
 

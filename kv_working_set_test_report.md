@@ -4,9 +4,9 @@ Date / 日期: 2026-09-04
 Simulator / 模拟器: TokenSim (roofline backend, Python 3.11)  
 Primary arrival / 主测试到达: `--distribution burst`
 
-This report documents the 70B / H200 comparison of **all-GPU decode** vs **hierarchical KV working-set fetch** (GPU 30% / DRAM 50% / SSD 20%, N3X-SLC 4K / `qd_cap=32`). Burst is the official case so `--qps` does not set inter-arrival time. Fetch is **page-fault**: the first decode faults the cold tail once; later steps only pay for tokens that newly slide off GPU. `gpu_frac` also caps GPU KV occupancy.
+This report documents the 70B / H200 comparison of **all-GPU decode** vs **hierarchical KV working-set fetch** (GPU 30% / DRAM 50% / SSD 20%, N3X-SLC 4K / `qd_cap=32`). Burst is the official case so `--qps` does not set inter-arrival time. Fetch is **per-step cold-set read**: every decode token pays DRAM/SSD I/O for `[0, gpu_start)`, because full attention needs the whole history and GPU only keeps the newest `gpu_frac`. Prefill / recompute stay on GPU (no fetch, full occupancy); after those steps GPU blocks are trimmed to `gpu_frac` (spill writes are not charged).
 
-本报告记录 LLaMa2-70B + 1×H200 上 **全 GPU decode** 与 **分层 KV 工作集读取**（GPU 30% / DRAM 50% / SSD 20%，N3X-SLC 4K / `qd_cap=32`）的对照。正式用例使用 **burst**。Fetch 为 **缺页**：第一次 decode 把冷尾读入一次，之后只为新滑出 GPU 的 token 付 I/O。`gpu_frac` 同时限制 GPU KV 占用。
+本报告记录 LLaMa2-70B + 1×H200 上 **全 GPU decode** 与 **分层 KV 工作集读取**（GPU 30% / DRAM 50% / SSD 20%，N3X-SLC 4K / `qd_cap=32`）的对照。正式用例使用 **burst**。Fetch 为 **每步读冷 KV**：全注意力每步都要碰全部历史，GPU 只留最新 `gpu_frac`，因此 `[0, gpu_start)` 每个 decode token 都从 DRAM/SSD 读。Prefill / 重算在 GPU 上完成（不加 fetch、占位按全量）；结束后把 GPU 块裁到 `gpu_frac`（写回不计）。
 
 ---
 
@@ -33,9 +33,9 @@ Working-set media (`data/kv_working_set/hier_30_50_20.json` = `hier_n3x_slc.json
 
 Other shipped SSDs (same 30/50/20, DRAM unchanged): `hier_n3x.json` MLC **18 µs**, `hier_n3.json` N3 **50 µs**. All three use 14 GB/s. See §9.
 
-v1 decode step: `T_step = T_roofline + T(dram_miss) + T(ssd_miss)` (page-fault). Prefill / recompute do **not** add fetch. GPU occupancy **is** reduced by `gpu_frac`: only `floor(S * gpu_frac)` tokens charge HBM blocks (see §8). SSD with `io_size_bytes=4096` uses `T = max(n_ios × L(QD) / QD, bytes / BW)`.
+v1 decode step: `T_step = T_roofline + T(dram) + T(ssd)` for the **whole** cold set `[0, gpu_start)` every decode token. Prefill / recompute do **not** add fetch and charge **full** GPU occupancy; after those steps the engine trims to `floor(S * gpu_frac)` HBM blocks. SSD with `io_size_bytes=4096` uses `T = max(n_ios × L(QD) / QD, bytes / BW)`.
 
-v1 decode：缺页读取。Prefill / 重算不加 fetch。`gpu_frac` **会减少** GPU KV 占用。SSD 按 4K 命令排队。
+v1 decode：每步读完整冷 KV。Prefill / 重算不加 fetch，占位按全量 GPU；结束后裁到 `gpu_frac`。SSD 按 4K 命令排队。
 
 ---
 
@@ -67,9 +67,9 @@ GPU 字节 = `MM_Card_Num × Capacity × 2^30`。若 `gpu_bytes <= W`，直接 `
 | **This H200 leftover for KV** | **141 − 120.763 = 20.237 GiB** | ≈ **8288 tokens** ≈ **518** blocks of 16 |
 | Concurrent S=1024 requests in leftover (`gpu_frac=1`) | **8** | 100 burst requests ⇒ GPU cache overflow ⇒ preempt/recompute |
 
-**Practical minimum for this test (one in-flight 70B request ~1k context):** about **123 GiB** HBM. **Minimum for the process to start:** just over **120.76 GiB**. H200 141 GiB is enough for weights and a short KV window, **not** for 100 concurrent full contexts. All-GPU therefore preempts 73 times; hierarchical `gpu_frac=0.3` preempts 46 times (§5).
+**Practical minimum for this test (one in-flight 70B request ~1k context):** about **123 GiB** HBM. **Minimum for the process to start:** just over **120.76 GiB**. H200 141 GiB is enough for weights and a short KV window, **not** for 100 concurrent full contexts. All-GPU therefore preempts 73 times; hierarchical `gpu_frac=0.3` preempts 26 times (§5). Prefill occupancy is full-context, so hierarchical prefill concurrency matches all-GPU (~16 at S=512); decode then trims to 30% HBM.
 
-对本测试「同时保住一条 ~1k 上下文的 70B 请求」，大约需要 **123 GiB**。进程能启动的下限是刚超过 **120.76 GiB**。H200 141 GiB 装得下权重和一小段 KV，**装不下** 100 条并发满上下文。全 GPU 抢占 73 次；分层 `gpu_frac=0.3` 抢占 46 次（§5）。
+对本测试「同时保住一条 ~1k 上下文的 70B 请求」，大约需要 **123 GiB**。进程能启动的下限是刚超过 **120.76 GiB**。H200 141 GiB 装得下权重和一小段 KV，**装不下** 100 条并发满上下文。全 GPU 抢占 73 次；分层 `gpu_frac=0.3` 抢占 26 次（§5）。Prefill 占位按全量，并发与全 GPU 相同；decode 再裁到 30%。
 
 TP>1 would split `W` across ranks; these numbers are **TP=1**.
 
@@ -98,9 +98,9 @@ python3.11 ./benchmark.py --batching paged-attn --qps 10 \
 
 ### Case 2 (official) — burst, hierarchical 30/50/20 / 正式用例：burst 分层
 
-Same arrival and cluster. Page-fault DRAM/SSD reads on decode (cold tail once, then window slide). **GPU blocks are capped at `gpu_frac=0.3`.** SSD is N3X-SLC 4K / `qd_cap=32` / 14 GB/s.
+Same arrival and cluster. Every decode step reads DRAM/SSD for `[0, gpu_start)`. **Prefill charges full prompt KV on GPU; decode then trims to `gpu_frac=0.3`.** SSD is N3X-SLC 4K / `qd_cap=32` / 14 GB/s.
 
-到达与集群相同。Decode 缺页读 DRAM/SSD。**GPU 块按 `gpu_frac=0.3` 限制。** SSD 为 N3X-SLC 4K。
+到达与集群相同。每个 decode 步读 `[0, gpu_start)`。**Prefill 按全量 prompt 占 GPU；decode 再裁到 `gpu_frac=0.3`。** SSD 为 N3X-SLC 4K。
 
 ```bash
 python3.11 ./benchmark.py --batching paged-attn --qps 10 \
@@ -132,33 +132,33 @@ Both official arms processed **102,452** tokens (51,226 prefill + 51,226 decode)
 
 ---
 
-## 5. Official results (burst, occupancy + SLC 4K) / 正式结果
+## 5. Official results (burst, per-step fetch + SLC 4K) / 正式结果
 
-Re-run 2026-09-04 with current code: `gpu_frac=0.3` occupancy **and** N3X-SLC 4K / `qd_cap=32` / 14 GB/s. All-GPU is unchanged.
+Re-run 2026-09-04 with current code: every decode token reads the cold set, prefill occupancy is full-context, decode occupancy is `gpu_frac=0.3`, N3X-SLC 4K / `qd_cap=32` / 14 GB/s. All-GPU is unchanged.
 
-本次重跑：占用限制 + SLC 4K。全 GPU 臂与此前一致。
+本次重跑：decode 每步读冷 KV；prefill 全量占位；decode 占用 30%；SLC 4K。全 GPU 臂与此前一致。
 
 | Metric | Case 1 all GPU | Case 2 hierarchical (SLC) | Ratio (hier / GPU) |
-| --- | --- | --- | --- |
-| TTFT p50 | 141.88 s | **2.94 s** | **0.021×** |
-| TTFT p99 | 316.77 s | 100.69 s | 0.32× |
-| TTFT min | **0.871 s** | 2.94 s | 3.37× |
-| TTFT avg | 146.92 s | 40.56 s | 0.28× |
-| TPOT p50 | **69.0 ms** | **92.6 ms** | **1.34×** |
-| TPOT p99 | 131.3 ms | 182.9 ms | 1.39× |
-| TPOT avg | 82.0 ms | 105.3 ms | 1.28× |
-| Per-request 1/TPOT p50 | 14.48 tok/s | 10.80 tok/s | 0.75× |
-| System token/s | **292.0** | **711.1** | **2.44×** |
-| Stdout prefill token/s | 146.0 | 355.6 | 2.44× |
-| Achieved r/s | 0.285 | 0.694 | 2.44× |
-| Simulated duration | 350.91 s | 144.07 s | 0.41× |
-| Preemptions / recomputes | 73 / 73 | 46 / 46 | 0.63× |
-| Σ `kv_ws_fetch_latency` | 0 | **5.76 s** | cold tail + slide |
-| SSD 4K IOs | 0 | 6,616,320 | 10338 tokens × 640 |
+| --- | ---: | ---: | ---: |
+| TTFT p50 | **141.88 s** | 1091.44 s | **7.69×** |
+| TTFT p99 | **316.77 s** | 2151.04 s | 6.79× |
+| TTFT min | **0.871 s** | **0.871 s** | 1.00× |
+| TTFT avg | **146.92 s** | 881.12 s | 6.00× |
+| TPOT p50 | **69.0 ms** | **2080.1 ms** | **30.1×** |
+| TPOT p99 | 131.3 ms | 4038.7 ms | 30.8× |
+| TPOT avg | 82.0 ms | 2316.0 ms | 28.2× |
+| Per-request 1/TPOT p50 | 14.48 tok/s | 0.48 tok/s | 0.033× |
+| System token/s | **292.0** | **32.5** | **0.11×** |
+| Stdout prefill token/s | 146.0 | 16.2 | 0.11× |
+| Achieved r/s | 0.285 | 0.032 | 0.11× |
+| Simulated duration | **350.91 s** | 3155.61 s | 8.99× |
+| Preemptions / recomputes | 73 / 73 | **26 / 26** | 0.36× |
+| Σ `kv_ws_fetch_latency` | 0 | **3011.65 s** | 95% of makespan |
+| SSD 4K IOs | 0 | **5.05e9** | every decode step |
 
-Hierarchical **system** token/s is 2.44× all-GPU because occupancy lets ~25 requests share the leftover 20 GiB instead of ~8 (`gpu_frac=1`). TTFT p50 drops from 142 s to 2.94 s (less queueing). TPOT and per-request tok/s get worse: decode batches are larger, and the first decode still page-faults the SSD tail (that cold step is inside the per-request TPOT average). Σ fetch is 5.76 s vs 144 s makespan.
+Hierarchical **system** token/s is 0.11× all-GPU because each decode token streams the off-GPU 70% from DRAM/SSD. Occupancy still cuts preemptions (73 → 26) and decode Peak B is still ~25, but the shared SSD queue turns extra concurrency into more I/O. TTFT p50 rises from 142 s to 1091 s: prefill itself has no fetch, but later prompts wait behind I/O-bound decode. TPOT p50 is 2.08 s vs 69 ms. Σ fetch is 3012 s of a 3156 s makespan.
 
-分层系统 token/s 是全 GPU 的 **2.44×**，原因是占用限制提高了并发，不是 SSD 比 HBM 快。TTFT p50 从 142 s 降到 2.94 s。TPOT / 单流变差是因为 decode batch 变大，以及第一次 decode 仍要缺页读 SSD。Σ fetch 5.76 s，相对 144 s 时长仍然很小。
+分层系统 token/s 是全 GPU 的 **0.11×**：每个 decode token 都要把不在 GPU 的 70% 从 DRAM/SSD 读回来。占用限制仍减少抢占（73 → 26），但共享 SSD 队列让更大的 batch 变成更多 I/O。TTFT p50 从 142 s 升到 1091 s：prefill 本身不加 fetch，但后续 prompt 卡在 I/O 受限的 decode 后面。Σ fetch 3012 s，占 3156 s 时长的 95%。
 
 Implied peak DRAM/SSD at this 30% split (S=1024, Peak B=25, **not enforced**): **31.3 GiB + 12.5 GiB** (see §8).
 
@@ -170,15 +170,15 @@ PNG + JSON: `kv_working_set_test_report/` (this re-run).
 
 **Figure 1 — hierarchical / all-GPU**
 
-TTFT ratios are **below 1** (occupancy cuts queue wait). TPOT ratios are **~1.34×**.
+TTFT ratios are **above 1** (queue wait behind I/O-bound decode). TPOT ratios are **~30×**.
 
-TTFT 倍数 < 1（排队缩短）。TPOT 约 1.34×。
+TTFT 倍数 > 1（排在慢 decode 后面）。TPOT 约 30×。
 
 ![Slowdown TTFT p50/p99 and TPOT p50/p99](kv_working_set_test_report/fig_slowdown.png)
 
 **Figure 2 — absolute TTFT and TPOT**
 
-Left: TTFT p50 142 s vs 2.94 s. Right: TPOT p50 69 vs 93 ms.
+Left: TTFT p50 142 s vs 1091 s. Right: TPOT p50 69 vs 2080 ms.
 
 左：TTFT p50。右：TPOT p50。
 
@@ -186,9 +186,9 @@ Left: TTFT p50 142 s vs 2.94 s. Right: TPOT p50 69 vs 93 ms.
 
 **Figure 3 — token/s**
 
-Same 102,452 tokens; duration 351 s vs 144 s. System token/s **292 vs 711**.
+Same 102,452 tokens; duration 351 s vs 3156 s. System token/s **292 vs 32.5**.
 
-两边仍是 102,452 token；时长 351 s vs 144 s。系统 token/s **292 vs 711**。
+两边仍是 102,452 token；时长 351 s vs 3156 s。系统 token/s **292 vs 32.5**。
 
 ![System, stdout, and per-request token/s](kv_working_set_test_report/fig_tokens.png)
 
@@ -200,57 +200,57 @@ Use JSON **`output_token_ps`** for cluster throughput (prefill+decode). The term
 
 集群吞吐看 JSON 的 **`output_token_ps`**。终端 `Thoughput ... token/s` **不含 decode token**（本负载大约少一半）。
 
-Per-request generation speed is `1000 / TPOT_ms` (14.48 vs 10.80 tok/s). That is **not** 292 or 711 tok/s: the worker interleaves other requests’ prefills and recomputes.
+Per-request generation speed is `1000 / TPOT_ms` (14.48 vs 0.48 tok/s). That is **not** 292 or 32.5 tok/s: the worker interleaves other requests’ prefills and recomputes.
 
-单请求生成速度是 `1000 / TPOT_ms`（14.48 vs 10.80 tok/s）。这不是系统 token/s：worker 会穿插别人的 prefill 和重算。
+单请求生成速度是 `1000 / TPOT_ms`（14.48 vs 0.48 tok/s）。这不是系统 token/s：worker 会穿插别人的 prefill 和重算。
 
 ---
 
-## 7. What page-fault changed / 缺页改了什么
+## 7. Per-step cold-set fetch / 每步读冷 KV
 
-Full-read-every-step would charge `T(dram)+T(ssd)` for the whole cold set on **every** decode token. Page-fault keeps a per-request watermark `kv_ws_fetched_end`: storage is `[0, gpu_start)`; only `[fetched_end, gpu_start)` is I/O. Official Case 2 uses this plus `gpu_frac=0.3` occupancy and SLC 4K: **711 tok/s**, 46 preemptions (§5).
+Full attention needs K/V of the entire history each decode token. GPU occupancy after prefill is only `gpu_frac`, so `[0, gpu_start)` is read from DRAM/SSD **every** decode step. Prefill / recompute rebuild KV on GPU (no fetch). Spill writes when trimming off GPU are still phase 2. Official Case 2 (30% + SLC 4K): **32.5 tok/s**, 26 preemptions, Σ fetch 3012 s (§5).
 
-每步全量读会对每个 decode token 收取整段冷 KV。缺页在请求上保留水位 `kv_ws_fetched_end`：存储区是 `[0, gpu_start)`，只对尚未读过的 `[fetched_end, gpu_start)` 计时。正式 Case 2 是缺页 + 占用 30% + SLC 4K。
+全注意力每步都要历史 K/V。Prefill 结束后 GPU 只留 `gpu_frac`，因此 `[0, gpu_start)` **每个 decode token 都读**。Prefill / 重算在 GPU 上重建 KV（不加 fetch）。挤出 GPU 的写回仍是 phase 2。正式 Case 2：**32.5 tok/s**。
 
 ---
 
 ## 8. gpu_frac occupancy sweep / 占用扫描
 
-`gpu_frac` now charges only `floor(S * gpu_frac)` tokens of GPU blocks (`gpu_resident_blocks` in `BlockManager`). Remainder of `(1 - gpu_frac)` is split DRAM:SSD = 5:2. Burst recipe unchanged. DRAM/SSD **capacity** is still infinite. Media matches official Case 2: DRAM 2 µs / 50 GB/s coalesced; SSD N3X-SLC 13 µs / 14 GB/s / 4K / `qd_cap=32`.
+Decode occupancy is `floor(S * gpu_frac)` GPU tokens after prefill/recompute trim. Prefill / recompute charge the **full** context on HBM (Peak B at S=512 is always **16**). Remainder of `(1 - gpu_frac)` is DRAM:SSD = 5:2 and is read **every decode step**. Burst recipe unchanged. DRAM/SSD **capacity** is still infinite. Media matches official Case 2: DRAM 2 µs / 50 GB/s coalesced; SSD N3X-SLC 13 µs / 14 GB/s / 4K / `qd_cap=32`.
 
-`gpu_frac` 现在只把 `floor(S * gpu_frac)` 个 token 计入 GPU block。其余按 DRAM:SSD = 5:2 拆分。Burst 与正式用例相同。DRAM/SSD **容量**仍无限。介质与正式 Case 2 相同。
+Decode 占用是 prefill 结束后裁到 `floor(S * gpu_frac)`。Prefill / 重算按全量占 GPU（S=512 时 Peak B 恒为 **16**）。其余按 DRAM:SSD = 5:2，**每个 decode 步都读**。Burst 与正式用例相同。DRAM/SSD **容量**仍无限。介质与正式 Case 2 相同。
 
 Peak decode concurrency at S=1024 is leftover blocks after watermark (`513`) / `ceil(floor(1024*gpu_frac)/16)`.
 
 | gpu_frac | Peak B (S=1024) | token/s | vs 100% | TPOT p50 | per-user | TTFT p50 | makespan | preempt | Σ fetch |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 100% | 8 | 292.0 | 1.00× | 69.0 ms | 14.5 | 141.9 s | 350.9 s | 73 | 0 |
-| 95% | 8 | 292.7 | 1.00× | 69.8 ms | 14.3 | 142.3 s | 350.0 s | 72 | 0.43 s |
-| 90% | 8 | 320.9 | 1.10× | 70.2 ms | 14.2 | 141.9 s | 319.3 s | 64 | 0.85 s |
-| 85% | 9 | 321.4 | 1.10× | 70.9 ms | 14.1 | 110.1 s | 318.7 s | 65 | 1.25 s |
-| 80% | 9 | 351.8 | 1.20× | 71.9 ms | 13.9 | 111.3 s | 291.2 s | 65 | 1.66 s |
-| 75% | 10 | 353.4 | 1.21× | 72.8 ms | 13.7 | 112.2 s | 289.9 s | 66 | 2.07 s |
-| 70% | 11 | 390.6 | 1.34× | 74.1 ms | 13.5 | 112.6 s | 262.3 s | 63 | 2.48 s |
-| 65% | 12 | 391.7 | 1.34× | 75.1 ms | 13.3 | 79.7 s | 261.5 s | 65 | 2.89 s |
-| 60% | 13 | 439.5 | 1.51× | 76.6 ms | 13.0 | 80.4 s | 233.1 s | 64 | 3.30 s |
-| 55% | 14 | 443.0 | 1.52× | 78.7 ms | 12.7 | 81.0 s | 231.3 s | 64 | 3.71 s |
-| 50% | 16 | 505.4 | 1.73× | 80.5 ms | 12.4 | 81.8 s | 202.7 s | 57 | 4.12 s |
-| 45% | 17 | 505.5 | 1.73× | 82.7 ms | 12.1 | 77.9 s | 202.7 s | 63 | 4.53 s |
-| 40% | 19 | 591.9 | 2.03× | 85.5 ms | 11.7 | 47.4 s | 173.1 s | 54 | 4.94 s |
-| 35% | 22 | 592.8 | 2.03× | 89.1 ms | 11.2 | 48.5 s | 172.8 s | 57 | 5.35 s |
-| **30%** | **25** | **711.1** | **2.44×** | 92.6 ms | 10.8 | **2.94 s** | 144.1 s | 46 | 5.76 s |
-| 25% | 32 | 717.3 | 2.46× | 98.7 ms | 10.1 | 3.51 s | 142.8 s | 50 | 6.17 s |
-| 20% | 39 | 835.2 | 2.86× | 108.4 ms | 9.2 | 4.20 s | 122.7 s | 41 | 6.58 s |
-| 15% | 51 | 908.2 | 3.11× | 126.1 ms | 7.9 | 5.77 s | 112.8 s | 49 | 6.99 s |
-| 10% | 73 | 1076.8 | 3.69× | 141.8 ms | 7.1 | 5.77 s | 95.1 s | 26 | 7.40 s |
+| 95% | 8 | 178.0 | 0.61× | 117.4 ms | 8.5 | 239.3 s | 575.6 s | 69 | 226 s |
+| 90% | 8 | 134.9 | 0.46× | 168.3 ms | 5.9 | 340.7 s | 759.3 s | 59 | 441 s |
+| 85% | 9 | 105.3 | 0.36× | 225.4 ms | 4.4 | 348.4 s | 972.6 s | 62 | 655 s |
+| 80% | 9 | 88.4 | 0.30× | 290.1 ms | 3.4 | 446.3 s | 1158.9 s | 52 | 870 s |
+| 75% | 10 | 74.7 | 0.26× | 362.4 ms | 2.8 | 556.7 s | 1370.9 s | 53 | 1083 s |
+| 70% | 11 | 65.8 | 0.23× | 445.9 ms | 2.2 | 683.3 s | 1557.5 s | 47 | 1298 s |
+| 65% | 12 | 57.9 | 0.20× | 541.9 ms | 1.8 | 565.8 s | 1769.9 s | 49 | 1512 s |
+| 60% | 13 | 52.4 | 0.18× | 651.8 ms | 1.5 | 676.9 s | 1954.4 s | 37 | 1726 s |
+| 55% | 14 | 47.2 | 0.16× | 783.9 ms | 1.3 | 805.8 s | 2169.6 s | 37 | 1942 s |
+| 50% | 16 | 43.5 | 0.15× | 938.1 ms | 1.1 | 953.9 s | 2354.0 s | 37 | 2153 s |
+| 45% | 17 | 39.9 | 0.14× | 1130.1 ms | 0.88 | 1078.2 s | 2568.0 s | 33 | 2371 s |
+| 40% | 19 | 37.2 | 0.13× | 1363.4 ms | 0.73 | 898.4 s | 2750.7 s | 26 | 2584 s |
+| 35% | 22 | 34.5 | 0.12× | 1694.6 ms | 0.59 | 883.5 s | 2966.5 s | 28 | 2800 s |
+| **30%** | **25** | **32.5** | **0.11×** | 2080.1 ms | 0.48 | **1091.4 s** | 3155.6 s | 26 | 3012 s |
+| 25% | 32 | 30.5 | 0.10× | 2681.1 ms | 0.37 | **3.1 s** | 3363.9 s | 29 | 3228 s |
+| 20% | 39 | 28.8 | 0.10× | 3511.7 ms | 0.28 | 3.1 s | 3562.5 s | 33 | 3442 s |
+| 15% | 51 | 27.2 | 0.09× | 4908.5 ms | 0.20 | 3.3 s | 3766.0 s | 46 | 3658 s |
+| 10% | 73 | 25.9 | 0.09× | 7029.0 ms | 0.14 | 3.2 s | 3960.3 s | 26 | 3872 s |
 
-**EN.** System token/s and TTFT improve because more requests share the GPU; TPOT and per-user tok/s worsen because decode batches are larger (attention is summed) and fetch grows. Σ fetch is still small vs makespan. The staircase (95≈100, 90≈85, …) is GPU **block** rounding, not 5% itself.
+**EN.** Lowering `gpu_frac` enlarges the per-step cold set, so token/s and TPOT get worse even though decode Peak B rises. Σ fetch is most of the makespan. TTFT p50 stays high until 25%: after trim there is enough free HBM to prefill the rest of the burst quickly, so p50 collapses to ~3 s while makespan keeps growing.
 
-**中文。** 系统 token/s 和 TTFT 变好是因为并发上去、排队缩短；TPOT 和单流变差是因为 decode batch 变大（attention 逐条相加）以及 fetch 增加。Σ fetch 相对 makespan 仍然很小。台阶来自 **block** 取整，不是 5% 本身有特殊意义。
+**中文。** `gpu_frac` 越低，每步要读的冷 KV 越大，token/s 和 TPOT 变差，尽管 decode Peak B 在上升。Σ fetch 占满大部分时长。TTFT p50 在 25% 才掉到约 3 s：裁块之后腾出的 HBM 够把剩余 burst 很快做完 prefill，但 decode 更慢、makespan 继续变长。
 
-At `gpu_frac=15%` and `10%`, TTFT p50 = p99 = 5.77 s: all 100 prompts fit in the first packed prefill.
+At `gpu_frac=10%`, TTFT p50 = 3.2 s and TTFT p99 = 5.95 s: the whole burst prefills early; decode then pays a 7.0 s TPOT.
 
-`gpu_frac=15%` 和 `10%` 时 TTFT p50=p99=5.77 s：100 条 prompt 都能进第一波 packed prefill。
+`gpu_frac=10%` 时 TTFT p50=3.2 s、p99=5.95 s：100 条 prompt 都能较早完成 prefill；随后 TPOT 7.0 s。
 
 ### Peak DRAM / SSD occupancy (not enforced) / 峰值占用（模拟器不限制）
 
@@ -318,13 +318,13 @@ Official Case 2 is the SLC row (same as `hier_30_50_20.json`).
 
 | Drive | L1 | token/s | vs SLC | TPOT p50 | TTFT p50 | TTFT p99 | Σ fetch | SSD IOs |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| SLC | 13 µs | **711.1** | 1.00× | 92.6 ms | 2.94 s | 100.7 s | **5.76 s** | 6.62e6 |
-| MLC | 18 µs | **706.0** | 0.99× | 93.4 ms | 2.94 s | 101.7 s | 6.79 s | 6.62e6 |
-| N3 | 50 µs | **675.2** | 0.95× | 98.9 ms | 2.94 s | 108.1 s | 13.41 s | 6.62e6 |
+| SLC | 13 µs | **32.5** | 1.00× | 2080 ms | 1091 s | 2151 s | **3012 s** | 5.05e9 |
+| MLC | 18 µs | **26.0** | 0.80× | 2602 ms | 1365 s | 2690 s | 3801 s | 5.05e9 |
+| N3 | 50 µs | **11.4** | 0.35× | 5943 ms | 3115 s | 6141 s | 8854 s | 5.05e9 |
 
-SLC is fastest, then MLC, then N3. The token/s gap is small because each request page-faults the cold tail **once** (10338 SSD tokens, 640×4K each); later decode is almost all DRAM window-slide. Prefill has no fetch, so TTFT p50 is the same (2.94 s). TTFT p99, duration, and token/s move with SSD L1.
+SLC is fastest, then MLC, then N3. The gap is large because **every** decode token re-reads the SSD tail (7.90e6 SSD tokens × 640 4K commands). SSD IOs are the same across drives; L1 sets `t_iops`. Prefill still has no fetch, but TTFT p50 moves with the drive: later prompts wait behind slower decode.
 
-排序是 SLC > MLC > N3。每请求只冷读一次，所以 token/s 差距不大。Prefill 不加 fetch，TTFT p50 相同；p99 / 时长 / token/s 随盘的 L1 变化。
+排序是 SLC > MLC > N3。每步都重读 SSD 冷尾，所以差距大。三盘 SSD IO 数相同，L1 决定 `t_iops`。Prefill 不加 fetch，但 TTFT p50 仍随盘变化：后续 prompt 排在更慢的 decode 后面。
 
 ![Drive ranking at qd_cap=32](kv_working_set_test_report/ssd_qos_eval/fig_drive_rank.png)
 
@@ -332,10 +332,10 @@ SLC is fastest, then MLC, then N3. The token/s gap is small because each request
 
 | `qd_cap` | SLC tok/s | SLC fetch | N3 tok/s | N3 fetch |
 | ---: | ---: | ---: | ---: | ---: |
-| **8** | 673.4 | 13.82 s | 560.6 | 44.42 s |
-| **32** | 711.1 | 5.76 s | 675.2 | 13.41 s |
-| **128** | 711.1 | 5.76 s | 675.2 | 13.41 s |
-| **512** | 711.1 | 5.76 s | 675.2 | 13.41 s |
+| **8** | 11.0 | 9170 s | 3.1 | 32540 s |
+| **32** | 32.5 | 3012 s | 11.4 | 8854 s |
+| **128** | 32.5 | 3012 s | 11.4 | 8854 s |
+| **512** | 32.5 | 3012 s | 11.4 | 8854 s |
 
 `qd_cap=8` serializes more, so fetch grows and token/s drops. At 32 and above, IOPS stays at the knee (`32 / L1`); SLC and N3 stay apart because their knees differ (~10 GB/s vs ~2.6 GB/s), not because of the 14 GB/s cap.
 
@@ -356,7 +356,7 @@ Python 3.11, repo root. Official two-arm commands in §3. Occupancy sweep in §8
 | Artifact | Path |
 | --- | --- |
 | Burst all-GPU JSON | [`kv_working_set_test_report/all_gpu_burst.json`](kv_working_set_test_report/all_gpu_burst.json) |
-| Burst hierarchical JSON (occupancy + SLC 4K) | [`kv_working_set_test_report/hier_burst.json`](kv_working_set_test_report/hier_burst.json) |
+| Burst hierarchical JSON (per-step fetch + SLC 4K) | [`kv_working_set_test_report/hier_burst.json`](kv_working_set_test_report/hier_burst.json) |
 | SSD QoS summary | [`kv_working_set_test_report/ssd_qos_eval/summary.json`](kv_working_set_test_report/ssd_qos_eval/summary.json) |
 | gpu_frac inference-speed MD | [`gpu_frac_inference_speed.md`](gpu_frac_inference_speed.md) |
 | Figure 1–3 PNG | [`fig_slowdown.png`](kv_working_set_test_report/fig_slowdown.png), [`fig_ttft_tpot.png`](kv_working_set_test_report/fig_ttft_tpot.png), [`fig_tokens.png`](kv_working_set_test_report/fig_tokens.png) |
