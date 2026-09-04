@@ -350,7 +350,8 @@ def print_kv_working_set_stats(engine: LLMEngine):
         + f"dram_read_bytes={stats.get('kv_ws_dram_read_bytes')}, "
         + f"ssd_read_bytes={stats.get('kv_ws_ssd_read_bytes')}, "
         + f"dram_ios={stats.get('kv_ws_dram_ios')}, "
-        + f"ssd_ios={stats.get('kv_ws_ssd_ios')}"
+        + f"ssd_ios={stats.get('kv_ws_ssd_ios')}, "
+        + f"spill_latency={stats.get('kv_ws_spill_latency')}"
     )
 
 

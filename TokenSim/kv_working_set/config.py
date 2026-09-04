@@ -8,11 +8,13 @@ from typing import Any
 from TokenSim.errors import ConfigurationError
 
 SUPPORTED_PLACEMENTS = {"sliding_window", "static_fraction"}
-SUPPORTED_OVERLAPS = {"blocking", "compute_overlap"}
+SUPPORTED_OVERLAPS = {"blocking", "layer_prefetch"}
 FRACTION_SUM_TOLERANCE = 1e-6
 IO_SIZE_COALESCED = 0
+IO_SIZE_128K = 131072
 QD_LATENCY_KNEE = 32
 DEFAULT_QD_CAP = 32
+DEFAULT_PCIE_BW_GBPS = 50.0
 
 
 @dataclass(frozen=True)
@@ -22,9 +24,21 @@ class MediaReadConfig:
     io_size_bytes: int = IO_SIZE_COALESCED
     qd_cap: int = DEFAULT_QD_CAP
     qd_latency_us: tuple[tuple[float, float], ...] = ()
+    write_latency_us: float | None = None
+    write_bw_gbps: float | None = None
 
     def queueing_enabled(self) -> bool:
         return self.io_size_bytes > IO_SIZE_COALESCED
+
+    def effective_write_latency_us(self) -> float:
+        if self.write_latency_us is None:
+            return self.read_latency_us
+        return self.write_latency_us
+
+    def effective_write_bw_gbps(self) -> float:
+        if self.write_bw_gbps is None:
+            return self.read_bw_gbps
+        return self.write_bw_gbps
 
 
 @dataclass(frozen=True)
@@ -35,6 +49,7 @@ class WorkingSetConfig:
     dram_frac: float = 0.0
     ssd_frac: float = 0.0
     overlap: str = "blocking"
+    pcie_bw_gbps: float = DEFAULT_PCIE_BW_GBPS
     dram: MediaReadConfig | None = None
     ssd: MediaReadConfig | None = None
     hbm: MediaReadConfig | None = None
@@ -52,10 +67,9 @@ class WorkingSetConfig:
                 + f"{self.overlap!r}; expected one of "
                 + f"{sorted(SUPPORTED_OVERLAPS)}"
             )
-        if self.overlap != "blocking":
+        if self.pcie_bw_gbps <= 0.0:
             raise ConfigurationError(
-                "working-set overlap "
-                + f"{self.overlap!r} is reserved for phase 2; v1 supports 'blocking'"
+                f"pcie_bw_gbps must be > 0, got {self.pcie_bw_gbps}"
             )
         for name in ("gpu_frac", "dram_frac", "ssd_frac"):
             value = getattr(self, name)
@@ -112,6 +126,9 @@ class WorkingSetConfig:
             dram_frac=float(payload.get("dram_frac", 0.0)),
             ssd_frac=float(payload.get("ssd_frac", 0.0)),
             overlap=str(payload.get("overlap", "blocking")),
+            pcie_bw_gbps=float(
+                payload.get("pcie_bw_gbps", DEFAULT_PCIE_BW_GBPS)
+            ),
             dram=_parse_media(payload.get("dram")),
             ssd=_parse_media(payload.get("ssd")),
             hbm=_parse_media(payload.get("hbm")),
@@ -127,12 +144,18 @@ def _parse_media(value: Any) -> MediaReadConfig | None:
         raise ConfigurationError(
             "media config requires read_latency_us and read_bw_gbps"
         )
+    write_latency = value.get("write_latency_us")
+    write_bw = value.get("write_bw_gbps")
     return MediaReadConfig(
         read_latency_us=float(value["read_latency_us"]),
         read_bw_gbps=float(value["read_bw_gbps"]),
         io_size_bytes=int(value.get("io_size_bytes", IO_SIZE_COALESCED)),
         qd_cap=int(value.get("qd_cap", DEFAULT_QD_CAP)),
         qd_latency_us=_parse_qd_latency(value.get("qd_latency_us")),
+        write_latency_us=(
+            None if write_latency is None else float(write_latency)
+        ),
+        write_bw_gbps=None if write_bw is None else float(write_bw),
     )
 
 
@@ -167,3 +190,7 @@ def _validate_media(name: str, media: MediaReadConfig) -> None:
         raise ConfigurationError(f"{name} io_size_bytes must be >= 0")
     if media.qd_cap < 1:
         raise ConfigurationError(f"{name} qd_cap must be >= 1")
+    if media.write_latency_us is not None and media.write_latency_us < 0.0:
+        raise ConfigurationError(f"{name} write_latency_us must be >= 0")
+    if media.write_bw_gbps is not None and media.write_bw_gbps <= 0.0:
+        raise ConfigurationError(f"{name} write_bw_gbps must be > 0")

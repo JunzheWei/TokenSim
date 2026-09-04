@@ -52,6 +52,8 @@ def main() -> None:
     b_dec = [peak_b(r["gpu_frac"], 1024) for r in rows]
     b_pre = [peak_b(1.0, 512) for _ in rows]
     fetch = [r["kv_ws_fetch_latency"] for r in rows]
+    qps_star = [r.get("qps_star", r.get("output_qps")) for r in rows]
+    n_star = [r.get("n_star", r.get("little_n", 0.0)) for r in rows]
 
     plt.rcParams.update(
         {
@@ -68,7 +70,7 @@ def main() -> None:
 
     # --- Figure 1: token/s with peak-B plateaus ---
     fig, ax = plt.subplots(figsize=(11.2, 5.6))
-    ax.set_ylim(0, 320)
+    ax.set_ylim(0, max(tok) * 1.15 if tok else 1)
     cmap = plt.cm.Blues
     unique_b = sorted(set(b_dec))
     b_to_color = {
@@ -110,9 +112,9 @@ def main() -> None:
 
     ax.set_xlim(103, 7)
     ax.set_xlabel("GPU KV fraction (gpu_frac)")
-    ax.set_ylabel("System token/s")
+    ax.set_ylabel("System token/s at Poisson knee")
     ax.set_title(
-        "System token/s vs GPU KV fraction — per-step cold-set I/O\n"
+        "Knee token/s vs GPU KV fraction — 128KiB DMA + layer prefetch\n"
         "Peak B = 513 GPU blocks / ceil(floor(1024 × gpu_frac) / 16)"
     )
     ax.set_xticks(pcts)
@@ -150,8 +152,8 @@ def main() -> None:
     cbar = fig.colorbar(sc, ax=ax, pad=0.02)
     cbar.set_label("gpu_frac (%)")
     ax.set_xlabel("Peak B at S=1024")
-    ax.set_ylabel("System token/s")
-    ax.set_title("System token/s vs peak B (token/s falls as more KV is off-GPU)")
+    ax.set_ylabel("System token/s at Poisson knee")
+    ax.set_title("Knee token/s vs peak B")
     fig.tight_layout()
     fig.savefig(HERE / "fig_tokens_vs_peak_b.png", dpi=160, bbox_inches="tight")
     plt.close(fig)
@@ -164,14 +166,14 @@ def main() -> None:
     axes[0].set_xticklabels([f"{p}%" for p in pcts], rotation=45, ha="right")
     axes[0].set_xlabel("GPU KV fraction")
     axes[0].set_ylabel("TTFT p50 (s)")
-    axes[0].set_title("TTFT p50 (queue wait + prefill; cliff below 30%)")
+    axes[0].set_title("TTFT p50 at Poisson knee")
     axes[1].plot(pcts, tpot_ms, color="#c45c26", marker="o", linewidth=2)
     axes[1].set_xlim(103, 7)
     axes[1].set_xticks(pcts)
     axes[1].set_xticklabels([f"{p}%" for p in pcts], rotation=45, ha="right")
     axes[1].set_xlabel("GPU KV fraction")
     axes[1].set_ylabel("TPOT p50 (ms)")
-    axes[1].set_title("TPOT p50 rises as each decode re-reads a larger cold set")
+    axes[1].set_title("TPOT p50 at Poisson knee")
     fig.tight_layout()
     fig.savefig(HERE / "fig_ttft_tpot_frac.png", dpi=160, bbox_inches="tight")
     plt.close(fig)
@@ -189,6 +191,27 @@ def main() -> None:
     ax.legend(loc="upper left")
     fig.tight_layout()
     fig.savefig(HERE / "fig_peak_b_prefill_decode.png", dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.2, 4.6))
+    axes[0].plot(pcts, qps_star, color="#4c78a8", marker="o", linewidth=2)
+    axes[0].set_xlim(103, 7)
+    axes[0].set_xticks(pcts)
+    axes[0].set_xticklabels([f"{p}%" for p in pcts], rotation=45, ha="right")
+    axes[0].set_xlabel("GPU KV fraction")
+    axes[0].set_ylabel("λ* (r/s)")
+    axes[0].set_title("Stable knee QPS")
+    axes[1].plot(pcts, n_star, color="#f58518", marker="o", linewidth=2, label="N* (Little)")
+    axes[1].plot(pcts, b_dec, color="#c45c26", marker="s", linewidth=2, label="Peak B")
+    axes[1].set_xlim(103, 7)
+    axes[1].set_xticks(pcts)
+    axes[1].set_xticklabels([f"{p}%" for p in pcts], rotation=45, ha="right")
+    axes[1].set_xlabel("GPU KV fraction")
+    axes[1].set_ylabel("concurrency")
+    axes[1].set_title("Little N* vs HBM Peak B")
+    axes[1].legend()
+    fig.tight_layout()
+    fig.savefig(HERE / "fig_knee_qps.png", dpi=160, bbox_inches="tight")
     plt.close(fig)
 
     print("wrote", HERE / "fig_tokens_peak_b.png")

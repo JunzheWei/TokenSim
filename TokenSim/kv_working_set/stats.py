@@ -21,6 +21,9 @@ class WorkingSetStats:
     kv_ws_ssd_read_tokens: int = 0
     kv_ws_dram_ios: int = 0
     kv_ws_ssd_ios: int = 0
+    kv_ws_spill_latency: float = 0.0
+    kv_ws_dram_write_bytes: int = 0
+    kv_ws_ssd_write_bytes: int = 0
 
     @classmethod
     def from_config(cls, config: WorkingSetConfig | None) -> "WorkingSetStats":
@@ -42,6 +45,11 @@ class WorkingSetStats:
         self.kv_ws_ssd_read_tokens += cost.ssd_tokens
         self.kv_ws_dram_ios += cost.dram_ios
         self.kv_ws_ssd_ios += cost.ssd_ios
+
+    def record_spill(self, cost: FetchCost) -> None:
+        self.kv_ws_spill_latency += cost.latency
+        self.kv_ws_dram_write_bytes += cost.dram_bytes
+        self.kv_ws_ssd_write_bytes += cost.ssd_bytes
 
     def aggregate(self, other: "WorkingSetStats") -> "WorkingSetStats":
         return WorkingSetStats(
@@ -70,6 +78,11 @@ class WorkingSetStats:
             + other.kv_ws_ssd_read_tokens,
             kv_ws_dram_ios=self.kv_ws_dram_ios + other.kv_ws_dram_ios,
             kv_ws_ssd_ios=self.kv_ws_ssd_ios + other.kv_ws_ssd_ios,
+            kv_ws_spill_latency=self.kv_ws_spill_latency + other.kv_ws_spill_latency,
+            kv_ws_dram_write_bytes=self.kv_ws_dram_write_bytes
+            + other.kv_ws_dram_write_bytes,
+            kv_ws_ssd_write_bytes=self.kv_ws_ssd_write_bytes
+            + other.kv_ws_ssd_write_bytes,
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -86,4 +99,7 @@ class WorkingSetStats:
             "kv_ws_ssd_read_tokens": self.kv_ws_ssd_read_tokens,
             "kv_ws_dram_ios": self.kv_ws_dram_ios,
             "kv_ws_ssd_ios": self.kv_ws_ssd_ios,
+            "kv_ws_spill_latency": self.kv_ws_spill_latency,
+            "kv_ws_dram_write_bytes": self.kv_ws_dram_write_bytes,
+            "kv_ws_ssd_write_bytes": self.kv_ws_ssd_write_bytes,
         }

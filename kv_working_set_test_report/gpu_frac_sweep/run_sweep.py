@@ -1,32 +1,26 @@
 #!/usr/bin/env python3
-"""Burst sweep: gpu_frac 100% → 10% in 5% steps, occupancy-constrained."""
+"""Poisson QPS-knee sweep: gpu_frac 100% → 10% in 5% steps."""
 
 from __future__ import annotations
 
 import json
-import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from bench_lib import (  # noqa: E402
+    IO_SIZE_128K,
+    SSD_SLC,
+    base_hier,
+    find_config_knee,
+    write_cfg,
+)
+
 OUT = Path(__file__).resolve().parent
 DRAM_SHARE = 5.0 / 7.0
-DRAM = {"read_latency_us": 2.0, "read_bw_gbps": 50.0}
-SSD = {
-    "read_latency_us": 13.0,
-    "read_bw_gbps": 14.0,
-    "io_size_bytes": 4096,
-    "qd_cap": 32,
-    "qd_latency_us": [
-        [1, 13.0],
-        [32, 13.0],
-        [64, 26.0],
-        [128, 52.0],
-        [256, 104.0],
-        [512, 208.0],
-    ],
-}
-HBM = {"read_latency_us": 0.0, "read_bw_gbps": 2000.0}
 
 
 def split_fracs(gpu_frac: float) -> tuple[float, float, float]:
@@ -45,79 +39,24 @@ def main() -> int:
         gpu = pct / 100.0
         g, d, s = split_fracs(gpu)
         tag = f"gpu_{pct:03d}"
-        cfg_path = OUT / f"{tag}.json"
-        cfg_path.write_text(
-            json.dumps(
-                {
-                    "enabled": True,
-                    "placement": "sliding_window",
-                    "gpu_frac": g,
-                    "dram_frac": d,
-                    "ssd_frac": s,
-                    "overlap": "blocking",
-                    "dram": dict(DRAM),
-                    "ssd": dict(SSD),
-                    "hbm": dict(HBM),
-                },
-                indent=2,
-            )
-            + "\n"
-        )
-        results_dir = OUT / tag
-        cmd = [
-            sys.executable,
-            str(ROOT / "benchmark.py"),
-            "--batching",
-            "paged-attn",
-            "--qps",
-            "10",
-            "--distribution",
-            "burst",
-            "--cluster",
-            str(ROOT / "data/clusters/1_h200/h1.json"),
-            "--model",
-            str(ROOT / "data/psla/llama-70b.json"),
-            "--verbose",
-            "none",
-            "--kv_working_set_config",
-            str(cfg_path),
-            "--results_path",
-            str(results_dir),
-        ]
+        cfg = base_hier(gpu_frac=g, dram_frac=d, ssd_frac=s, ssd=dict(SSD_SLC))
+        if s <= 0.0:
+            cfg.pop("ssd", None)
+            cfg["ssd_frac"] = 0.0
+        cfg_path = write_cfg(OUT / f"{tag}.json", cfg)
         print(f"=== {tag} gpu={g:.2f} dram={d:.4f} ssd={s:.4f} ===", flush=True)
-        proc = subprocess.run(cmd, cwd=ROOT, check=False)
-        if proc.returncode != 0:
-            print(f"FAILED {tag} rc={proc.returncode}", flush=True)
-            return proc.returncode
-        result = json.loads((results_dir / "result_inf.json").read_text())
-        row = {
-            "gpu_frac": g,
-            "dram_frac": d,
-            "ssd_frac": s,
-            "duration": result["duration"],
-            "output_token_ps": result["output_token_ps"],
-            "output_qps": result["output_qps"],
-            "ttft_p50": result["prefill_time"]["p50"],
-            "ttft_p99": result["prefill_time"]["p99"],
-            "ttft_min": result["prefill_time"].get("min", None),
-            "tpot_p50": result["decode_time"]["p50"],
-            "tpot_p99": result["decode_time"]["p99"],
-            "preemption_count": result["preemption_count"],
-            "recomputation_count": result["recomputation_count"],
-            "recomputed_tokens": result["recomputed_tokens"],
-            "recompute_service_time": result["recompute_service_time"],
-            "kv_ws_fetch_latency": result["kv_ws_fetch_latency"],
-            "kv_ws_dram_read_tokens": result["kv_ws_dram_read_tokens"],
-            "kv_ws_ssd_read_tokens": result["kv_ws_ssd_read_tokens"],
-            "kv_ws_ssd_ios": result.get("kv_ws_ssd_ios", 0),
-        }
-        summary.append(row)
-        print(
-            f"  tok/s={row['output_token_ps']:.1f} tpot_p50={row['tpot_p50']*1e3:.1f}ms "
-            f"ttft_p50={row['ttft_p50']:.1f}s preempt={row['preemption_count']} "
-            f"fetch={row['kv_ws_fetch_latency']:.2f}s",
-            flush=True,
+        row = find_config_knee(
+            tag,
+            OUT / tag,
+            cfg_path,
+            {
+                "gpu_frac": g,
+                "dram_frac": d,
+                "ssd_frac": s,
+                "io_size_bytes": 0 if s <= 0.0 else IO_SIZE_128K,
+            },
         )
+        summary.append(row)
     (OUT / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(f"wrote {OUT / 'summary.json'}", flush=True)
     return 0

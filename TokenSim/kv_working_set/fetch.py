@@ -40,6 +40,15 @@ def media_read_latency(bytes_: int, media: MediaReadConfig | None) -> float:
     return media.read_latency_us / 1e6 + bytes_ / _GB / max(_EPS, media.read_bw_gbps)
 
 
+def media_write_latency(bytes_: int, media: MediaReadConfig | None) -> float:
+    if bytes_ <= 0 or media is None:
+        return 0.0
+    return media.effective_write_latency_us() / 1e6 + bytes_ / _GB / max(
+        _EPS,
+        media.effective_write_bw_gbps(),
+    )
+
+
 def _interpolate_qd_latency_us(
     points: tuple[tuple[float, float], ...],
     qd: float,
@@ -58,27 +67,40 @@ def _interpolate_qd_latency_us(
     return points[-1][1]
 
 
-def qd_latency_us(media: MediaReadConfig, qd: int) -> float:
+def qd_latency_us(
+    media: MediaReadConfig,
+    qd: int,
+    *,
+    write: bool = False,
+) -> float:
     qd = max(1, int(qd))
     if media.qd_latency_us:
         return _interpolate_qd_latency_us(media.qd_latency_us, float(qd))
+    base = (
+        media.effective_write_latency_us() if write else media.read_latency_us
+    )
     if qd <= QD_LATENCY_KNEE:
-        return media.read_latency_us
-    return media.read_latency_us * (qd / QD_LATENCY_KNEE)
+        return base
+    return base * (qd / QD_LATENCY_KNEE)
 
 
 def media_queue_latency(
     bytes_: int,
     n_ios: int,
     media: MediaReadConfig | None,
+    *,
+    write: bool = False,
 ) -> float:
     """Roofline: max(command drain, transfer). Prefill is not charged here."""
     if bytes_ <= 0 or media is None:
         return 0.0
-    t_bw = bytes_ / _GB / max(_EPS, media.read_bw_gbps)
+    bw = (
+        media.effective_write_bw_gbps() if write else media.read_bw_gbps
+    )
+    t_bw = bytes_ / _GB / max(_EPS, bw)
     n_ios = max(1, int(n_ios))
     qd = min(n_ios, media.qd_cap)
-    lat_s = qd_latency_us(media, qd) / 1e6
+    lat_s = qd_latency_us(media, qd, write=write) / 1e6
     t_iops = n_ios * lat_s / qd
     return max(t_iops, t_bw)
 
@@ -86,12 +108,36 @@ def media_queue_latency(
 def media_access_latency(
     bytes_: int,
     media: MediaReadConfig | None,
+    *,
+    write: bool = False,
 ) -> float:
     if bytes_ <= 0 or media is None:
         return 0.0
     if not media.queueing_enabled():
+        if write:
+            return media_write_latency(bytes_, media)
         return media_read_latency(bytes_, media)
-    return media_queue_latency(bytes_, media_n_ios(bytes_, media), media)
+    return media_queue_latency(
+        bytes_,
+        media_n_ios(bytes_, media),
+        media,
+        write=write,
+    )
+
+
+def layer_prefetch_step_latency(
+    compute: float,
+    fetch: float,
+    n_layers: int,
+) -> float:
+    """One-layer bubble plus overlap of the remaining fetch with compute."""
+    n = max(1, int(n_layers))
+    fetch = max(0.0, float(fetch))
+    compute = max(0.0, float(compute))
+    if n <= 1 or fetch <= 0.0:
+        return compute + fetch
+    t_layer = fetch / n
+    return t_layer + max(compute, fetch - t_layer)
 
 
 def _overlap(start_a: int, end_a: int, start_b: int, end_b: int) -> int:
@@ -186,6 +232,106 @@ def decode_fetch_for_requests(
     )
     return FetchCost(
         latency=t_dram + t_ssd,
+        dram_tokens=dram_tokens,
+        ssd_tokens=ssd_tokens,
+        dram_bytes=dram_bytes,
+        ssd_bytes=ssd_bytes,
+        split=last_split,
+        dram_ios=dram_ios,
+        ssd_ios=ssd_ios,
+    )
+
+
+def _spill_context_len(req: object) -> int:
+    prefill_len = int(getattr(req, "prefill_len", 0) or 0)
+    generation_idx = int(getattr(req, "generation_idx", 0) or 0)
+    if getattr(req, "is_prefill", False):
+        return prefill_len + 1
+    return prefill_len + generation_idx
+
+
+def request_will_trim(req: object, config: WorkingSetConfig) -> bool:
+    if not config.enabled or config.gpu_frac >= 1.0:
+        return False
+    decode_len = int(getattr(req, "decode_len", 1) or 0)
+    generation_idx = int(getattr(req, "generation_idx", 0) or 0)
+    if getattr(req, "needs_recompute", False):
+        return decode_len > generation_idx
+    if getattr(req, "is_prefill", False):
+        return decode_len > 1
+    return False
+
+
+def spill_cost(
+    context_len: int,
+    config: WorkingSetConfig,
+    size_per_token: int,
+) -> FetchCost:
+    """Charge DRAM/SSD writes plus shared PCIe for the cold set after trim."""
+    split = split_context(context_len, config)
+    size_per_token = max(0, int(size_per_token))
+    dram_tokens = split.dram
+    ssd_tokens = split.ssd
+    dram_bytes = dram_tokens * size_per_token
+    ssd_bytes = ssd_tokens * size_per_token
+    dram_ios = media_n_ios(dram_bytes, config.dram)
+    ssd_ios = media_n_ios(ssd_bytes, config.ssd)
+    t_dram = media_access_latency(dram_bytes, config.dram, write=True)
+    t_ssd = media_access_latency(ssd_bytes, config.ssd, write=True)
+    t_pcie = (dram_bytes + ssd_bytes) / _GB / max(_EPS, config.pcie_bw_gbps)
+    return FetchCost(
+        latency=max(t_dram, t_ssd, t_pcie),
+        dram_tokens=dram_tokens,
+        ssd_tokens=ssd_tokens,
+        dram_bytes=dram_bytes,
+        ssd_bytes=ssd_bytes,
+        split=split,
+        dram_ios=dram_ios,
+        ssd_ios=ssd_ios,
+    )
+
+
+def spill_cost_for_requests(
+    requests: list[object],
+    config: WorkingSetConfig,
+    size_per_token: int,
+) -> FetchCost:
+    """Batch trim writes; DRAM/SSD DMA in parallel, shared PCIe cap."""
+    empty = FetchCost(
+        latency=0.0,
+        dram_tokens=0,
+        ssd_tokens=0,
+        dram_bytes=0,
+        ssd_bytes=0,
+        split=split_context(0, config),
+    )
+    if not config.enabled or config.gpu_frac >= 1.0 or not requests:
+        return empty
+    dram_tokens = 0
+    ssd_tokens = 0
+    dram_bytes = 0
+    ssd_bytes = 0
+    dram_ios = 0
+    ssd_ios = 0
+    last_split = empty.split
+    for req in requests:
+        if not request_will_trim(req, config):
+            continue
+        cost = spill_cost(_spill_context_len(req), config, size_per_token)
+        dram_tokens += cost.dram_tokens
+        ssd_tokens += cost.ssd_tokens
+        dram_bytes += cost.dram_bytes
+        ssd_bytes += cost.ssd_bytes
+        dram_ios += cost.dram_ios
+        ssd_ios += cost.ssd_ios
+        last_split = cost.split
+    if dram_bytes <= 0 and ssd_bytes <= 0:
+        return empty
+    t_dram = media_access_latency(dram_bytes, config.dram, write=True)
+    t_ssd = media_access_latency(ssd_bytes, config.ssd, write=True)
+    t_pcie = (dram_bytes + ssd_bytes) / _GB / max(_EPS, config.pcie_bw_gbps)
+    return FetchCost(
+        latency=max(t_dram, t_ssd, t_pcie),
         dram_tokens=dram_tokens,
         ssd_tokens=ssd_tokens,
         dram_bytes=dram_bytes,

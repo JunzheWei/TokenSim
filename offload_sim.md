@@ -123,8 +123,10 @@ Coalesced (`io_size_bytes = 0`, default) matches `OffloadTier` in
 T(tier) = read_latency_us / 1e6 + bytes(tier) / 2^30 / max(eps, read_bw_gbps)
 ```
 
-Queued SSD (`io_size_bytes > 0`) splits the miss into 4K commands and applies a
-host-visible `L(QD)` curve. Default synthesis (no `qd_latency_us` table):
+Queued SSD (`io_size_bytes > 0`) splits the miss into DMA commands and applies a
+host-visible `L(QD)` curve. Shipped SSD uses **128KiB** (`io_size_bytes=131072`)
+so sequential/large-block reads sit on the bandwidth roof (~14 GB/s), not the
+4K IOPS knee. Default synthesis (no `qd_latency_us` table):
 
 ```text
 n_ios = ceil(bytes / io_size_bytes)
@@ -137,8 +139,9 @@ T     = max(n_ios * L / QD, bytes / 2^30 / read_bw_gbps)
 `qd_cap` is the one-step outstanding-command cap. Raising it drops `t_iops`
 until `T` hits bandwidth and drives with different `L1` look the same.
 
-`io_size_bytes = 0` 时仍是一次固定延迟 + 传输。`io_size_bytes > 0` 时按 4K
-命令排队；`qd_cap` 决定延迟能否盖过带宽。
+`io_size_bytes = 0` 时仍是一次固定延迟 + 传输。`io_size_bytes > 0` 时按 DMA
+粒度排队；正式配方是 **128KiB**，避免 4K 命令把顺序盘打成 IOPS 瓶颈。`qd_cap`
+决定延迟能否盖过带宽。
 
 GPU / HBM fraction uses the existing roofline (no separate HBM fetch in v1).
 HBM fields in config are optional metadata for phase 2.
@@ -147,12 +150,19 @@ GPU 比例走现有 roofline，v1 不再单独加 HBM 读取。配置里的 `hbm
 
 ### 3.4 Step latency / 单步时延
 
-v1 uses **blocking** overlap and **per-step cold-set fetch** / v1 阻塞叠加 + **每步读冷 KV**:
+Shipped configs use **layer-prefetch** overlap and **per-step cold-set fetch** /
+正式配方是层间预取 + **每步读冷 KV**:
 
 ```text
 T_fetch = T(dram) + T(ssd)   # entire [0, S_gpu_start) every decode step
-T_step  = T_roofline_decode + T_fetch
+T_step  = T_fetch / N + max(T_roofline, T_fetch * (N-1) / N)
 ```
+
+`N` is `model.Nlayer` (80 for LLaMa2-70B; PP uses this rank's layer count).
+That is one layer of bubble plus overlap of the remaining fetch with compute.
+`overlap: "blocking"` still does `T_roofline + T_fetch` for comparisons.
+
+`N` 是模型层数。计算绑定时几乎藏住摆运；I/O 绑定时仍约等于 `T_fetch`。
 
 Full attention needs every historical K/V each decode step. GPU keeps only the
 newest ``gpu_frac`` of the context, so ``[0, S_gpu_start)`` is read from
@@ -169,13 +179,15 @@ Notes / 说明:
 
 - Prefill and recompute stay all-GPU **for latency** (no fetch) **and occupancy**
   (full prompt / rebuilt context on HBM). After those steps, GPU blocks are
-  trimmed to ``gpu_frac``; spill **writes** are not charged. Prefill / 重算时延
-  与占位都按全量 GPU；结束后把块裁到 ``gpu_frac``，写回不计。
+  trimmed to ``gpu_frac``. Spill **writes** are charged once:
+  `T_spill = max(T_dram_wr, T_ssd_wr, (dram_bytes+ssd_bytes)/pcie_bw)` and added
+  to that prefill/recompute step so TTFT includes writeback. Prefill / 重算时延
+  与占位都按全量 GPU；结束后把块裁到 ``gpu_frac``，按写入带宽和 PCIe 争用计一次写回。
 - Preemption is **recompute**, not swap: drop GPU KV and rebuild with compute.
-  Recompute pays GPU time, not DRAM/SSD I/O. 抢占走重算，不走 KV swap。
+  Recompute pays GPU time, then the same trim+spill. 抢占走重算，不走 KV swap。
 - v1 does **not** subtract off-GPU KV from HBM attention in the roofline
   (pessimistic double-count). Phase 2 再从 HBM attention 里扣掉不在 GPU 的流量。
-- Spill / write-back is phase 2. 新 token 把旧块挤出 GPU 的写回是 phase 2。
+- Decode window-slide writes are not charged. Decode 滑窗挤出的写回本轮不计。
 
 ### 3.5 Sliding-window split / 滑窗拆分
 
@@ -215,7 +227,8 @@ Standalone JSON under `data/kv_working_set/`. Do **not** overload
   "gpu_frac": 0.3,
   "dram_frac": 0.5,
   "ssd_frac": 0.2,
-  "overlap": "blocking",
+  "overlap": "layer_prefetch",
+  "pcie_bw_gbps": 50.0,
   "dram": {
     "read_latency_us": 2.0,
     "read_bw_gbps": 50.0
@@ -223,7 +236,7 @@ Standalone JSON under `data/kv_working_set/`. Do **not** overload
   "ssd": {
     "read_latency_us": 13.0,
     "read_bw_gbps": 14.0,
-    "io_size_bytes": 4096,
+    "io_size_bytes": 131072,
     "qd_cap": 32
   },
   "hbm": {
@@ -238,8 +251,9 @@ Standalone JSON under `data/kv_working_set/`. Do **not** overload
 | `enabled` | yes | false = today's behavior / 关闭则与现网一致 |
 | `placement` | yes | `sliding_window` \| `static_fraction` |
 | `gpu_frac` / `dram_frac` / `ssd_frac` | yes | Sum ≈ 1 |
-| `overlap` | yes | v1: `blocking` only; `compute_overlap` reserved / 仅 blocking |
-| `dram` / `ssd` | yes when frac > 0 | `read_latency_us` ≥ 0, `read_bw_gbps` > 0. Optional: `io_size_bytes` (0 = coalesced), `qd_cap` (≥ 1, default 32), `qd_latency_us` as `[qd, latency_us]` pairs. DRAM example is PCIe DMA (~2 µs, ~50 GB/s, coalesced). Shipped SSD is N3X-SLC 4K@QD1 **13 µs** / **14 GB/s** / 4K / `qd_cap=32`. Also `hier_n3x.json` (18 µs) and `hier_n3.json` (50 µs). |
+| `overlap` | yes | `blocking` or `layer_prefetch` (shipped default) |
+| `pcie_bw_gbps` | no | Host link for spill contention; default 50 |
+| `dram` / `ssd` | yes when frac > 0 | `read_latency_us` ≥ 0, `read_bw_gbps` > 0. Optional write fields default to the read values. Optional: `io_size_bytes` (0 = coalesced; shipped SSD is **128KiB**), `qd_cap` (≥ 1, default 32), `qd_latency_us` as `[qd, latency_us]` pairs. DRAM example is PCIe DMA (~2 µs, ~50 GB/s, coalesced). Shipped SSD is N3X-SLC **13 µs** / **14 GB/s** / 128KiB / `qd_cap=32`. Also `hier_n3x.json` (18 µs) and `hier_n3.json` (50 µs). |
 | `hbm` | no | Ignored in v1 latency / v1 不计时延 |
 
 Shipped examples / 附带示例:
@@ -342,11 +356,14 @@ Reuse `data/clusters/1_h200/h1.json` + `data/psla/llama-70b.json` + `paged-attn`
 | `S_dram=S_ssd=0` | `T_fetch == 0` |
 | Hand calc `T_fetch` | `io_size=0` matches `lat + bytes/bw` |
 | 70B token / 4K | 2.50 MiB → 640 IOs |
+| 70B token / 128KiB | 2.50 MiB → 20 IOs |
 | `qd_cap=8` vs `512` | smaller cap → larger `T` on the same miss |
 | SLC/MLC/N3 at `qd_cap=32` | `T(13) < T(18) < T(50)` |
 | `gpu_frac=1` vs disabled | identical decode step latency |
-| Hierarchical vs disabled | decode latency += full-cold-set `T_fetch` |
-| Prefill / recompute | no fetch addend; full GPU occupancy then trim |
+| Hierarchical vs disabled (blocking) | decode latency += full-cold-set `T_fetch` |
+| `layer_prefetch` | `T_step = T_fetch/N + max(T_roofline, T_fetch*(N-1)/N)` |
+| Trim spill | `gpu_frac=1` is 0; otherwise `max(writes, PCIe)` |
+| Prefill / recompute | no fetch addend; full GPU occupancy then trim+spill |
 | Second decode step | rereads the whole ``[0, gpu_start)``, not a watermark miss |
 
 ---
@@ -357,9 +374,7 @@ Reuse `data/clusters/1_h200/h1.json` + `data/psla/llama-70b.json` + `paged-attn`
 - Changing Mooncake decode `start_load_kv` / `wait_for_save`
 - Using CPU `BlockAllocator` as placement backend
 - Subtracting off-GPU KV from HBM roofline
-- Write / spill modeling
-- `compute_overlap` (`max(T_roofline, T_fetch)`)
-- Host vs device write mix (`write_frac` / bandwidth steal)
+- Decode window-slide writes (only prompt-end trim is charged)
 - DRAM / SSD **capacity** limits (only GPU HBM blocks are finite)
 
 ---
@@ -367,12 +382,19 @@ Reuse `data/clusters/1_h200/h1.json` + `data/psla/llama-70b.json` + `paged-attn`
 ## 9. Phase 2 Backlog / 后续
 
 1. **Accuracy / 精度:** drop off-GPU tokens from HBM attention bytes.
-2. **Overlap:** `T_step = max(T_roofline, T_fetch)`.
-3. **Writes / 写回:** spill when the window slides off GPU; optional write mix.
+2. **Prefill-Decode 分离:** independent P/D workers plus KV transfer. Expected to
+   remove the same-card TTFT cliff from P/D fighting over HBM; decode nodes still
+   pay per-step cold KV. Reuse `data/clusters/8_a100/p2d5.json` and
+   `dispatch_prefill_to_decode`. Not run in the current 1×H200 official recipe.
+3. **GQA 对照:** `TransformerRoofline/hardware_models.json` already has
+   `LLaMa2-70B-GQA` (`Grouped_Num=8`). Official `LLaMa2-70B` is MHA-64
+   (~2.50 MiB/token); GQA-8 is ~1/8 the KV. Same 128KiB + layer-prefetch +
+   Poisson-knee recipe, do not change `data/psla/llama-70b.json` until then.
 4. **Placement:** importance / attention-score residency.
 5. **Traces:** per-step `(tier, tokens, bytes, latency)`.
 6. **Block table:** mark physical blocks with tier.
-7. **Docs:** optional `docs/kv-working-set.md` user guide.
+7. **Capacity:** finite DRAM/SSD.
+8. **Docs:** optional `docs/kv-working-set.md` user guide.
 
 ---
 

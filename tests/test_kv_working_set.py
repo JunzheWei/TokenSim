@@ -7,14 +7,21 @@ from TokenSim.block.block_manager import BlockManager
 from TokenSim.config.config import ParallelConfig
 from TokenSim.errors import ConfigurationError
 from TokenSim.config.constants import _GB
-from TokenSim.kv_working_set.config import MediaReadConfig, WorkingSetConfig
+from TokenSim.kv_working_set.config import (
+    IO_SIZE_128K,
+    MediaReadConfig,
+    WorkingSetConfig,
+)
 from TokenSim.kv_working_set.fetch import (
     decode_fetch_for_requests,
     fetch_cost,
+    layer_prefetch_step_latency,
     media_access_latency,
     media_n_ios,
     media_queue_latency,
     media_read_latency,
+    spill_cost,
+    spill_cost_for_requests,
 )
 from TokenSim.kv_working_set.placement import (
     gpu_resident_blocks,
@@ -33,7 +40,13 @@ HIER_FRACS = (0.3, 0.5, 0.2)
 SHIPPED_KV_WS = REPO_ROOT / "data" / "kv_working_set"
 
 
+class _ModelStub:
+    Nlayer = 80
+
+
 class _RooflineStub:
+    models = {"model": _ModelStub()}
+
     def Compute_Timebreakdown_Iteration(
         self,
         prefill_len,
@@ -125,13 +138,21 @@ class WorkingSetConfigTest(unittest.TestCase):
                 dram=MediaReadConfig(read_latency_us=-1.0, read_bw_gbps=10.0),
             )
 
-    def test_compute_overlap_is_rejected_in_v1(self):
+    def test_compute_overlap_is_rejected(self):
         with self.assertRaises(ConfigurationError):
             WorkingSetConfig(
                 enabled=True,
                 gpu_frac=1.0,
                 overlap="compute_overlap",
             )
+
+    def test_layer_prefetch_is_accepted(self):
+        cfg = WorkingSetConfig(
+            enabled=True,
+            gpu_frac=1.0,
+            overlap="layer_prefetch",
+        )
+        self.assertEqual(cfg.overlap, "layer_prefetch")
 
     def test_missing_media_when_frac_positive(self):
         with self.assertRaises(ConfigurationError):
@@ -156,8 +177,10 @@ class WorkingSetConfigTest(unittest.TestCase):
         self.assertEqual(hier.ssd_frac, 0.2)
         self.assertEqual(hier.ssd.read_latency_us, 13.0)
         self.assertEqual(hier.ssd.read_bw_gbps, 14.0)
-        self.assertEqual(hier.ssd.io_size_bytes, 4096)
+        self.assertEqual(hier.ssd.io_size_bytes, IO_SIZE_128K)
         self.assertEqual(hier.ssd.qd_cap, 32)
+        self.assertEqual(hier.overlap, "layer_prefetch")
+        self.assertEqual(hier.pcie_bw_gbps, 50.0)
 
     def test_negative_io_size_is_rejected(self):
         with self.assertRaises(ConfigurationError):
@@ -197,8 +220,9 @@ class WorkingSetConfigTest(unittest.TestCase):
         self.assertEqual(n3.ssd.read_latency_us, 50.0)
         for cfg in (slc, mlc, n3, shipped):
             self.assertEqual(cfg.ssd.read_bw_gbps, 14.0)
-            self.assertEqual(cfg.ssd.io_size_bytes, 4096)
+            self.assertEqual(cfg.ssd.io_size_bytes, IO_SIZE_128K)
             self.assertEqual(cfg.ssd.qd_cap, 32)
+            self.assertEqual(cfg.overlap, "layer_prefetch")
             self.assertFalse(cfg.dram.queueing_enabled())
         self.assertEqual(shipped.ssd.read_latency_us, slc.ssd.read_latency_us)
 
@@ -432,6 +456,50 @@ class WorkingSetLatencyBackendTest(unittest.TestCase):
         roofline_decode = observed - fetch
         self.assertAlmostEqual(roofline_decode, 0.011 * DECODE_SCALE)
 
+    def test_layer_prefetch_hides_fetch_when_compute_bound(self):
+        request = _decode_request(prefill_len=99, generation_idx=1)
+        config = WorkingSetConfig(
+            enabled=True,
+            placement="sliding_window",
+            gpu_frac=HIER_FRACS[0],
+            dram_frac=HIER_FRACS[1],
+            ssd_frac=HIER_FRACS[2],
+            overlap="layer_prefetch",
+            dram=MediaReadConfig(read_latency_us=100.0, read_bw_gbps=50.0),
+            ssd=MediaReadConfig(read_latency_us=100.0, read_bw_gbps=7.0),
+        )
+        disabled = RooflineLatencyBackend(
+            _RooflineStub(),
+            "model",
+            "hardware",
+            ParallelConfig(),
+        )
+        hierarchical = RooflineLatencyBackend(
+            _RooflineStub(),
+            "model",
+            "hardware",
+            ParallelConfig(),
+            working_set_config=config,
+            size_per_token=SIZE_PER_TOKEN,
+        )
+        compute = disabled.estimate_step_latency([request])
+        fetch = fetch_cost(100, config, SIZE_PER_TOKEN).latency
+        observed = hierarchical.estimate_step_latency([request])
+        expected = layer_prefetch_step_latency(compute, fetch, 80)
+        self.assertAlmostEqual(observed, expected)
+        self.assertLess(observed, compute + fetch)
+        self.assertAlmostEqual(
+            hierarchical.kv_ws_stats.kv_ws_fetch_latency,
+            fetch,
+        )
+
+    def test_layer_prefetch_stays_fetch_bound_when_io_dominates(self):
+        compute = 0.01
+        fetch = 2.0
+        observed = layer_prefetch_step_latency(compute, fetch, 80)
+        self.assertAlmostEqual(observed, fetch / 80 + fetch * 79 / 80)
+        self.assertAlmostEqual(observed, fetch)
+
 
 def _queued_ssd(latency_us: float, qd_cap: int = 32) -> MediaReadConfig:
     return MediaReadConfig(
@@ -455,10 +523,19 @@ def _ssd_only_config(ssd: MediaReadConfig) -> WorkingSetConfig:
 
 
 class WorkingSetQueueingTest(unittest.TestCase):
-    def test_70b_token_is_640_ios(self):
+    def test_70b_token_is_640_ios_at_4k(self):
         self.assertEqual(SIZE_70B_TOKEN, 2_621_440)
         media = _queued_ssd(13.0)
         self.assertEqual(media_n_ios(SIZE_70B_TOKEN, media), 640)
+
+    def test_70b_token_is_20_ios_at_128k(self):
+        media = MediaReadConfig(
+            read_latency_us=13.0,
+            read_bw_gbps=14.0,
+            io_size_bytes=IO_SIZE_128K,
+            qd_cap=32,
+        )
+        self.assertEqual(media_n_ios(SIZE_70B_TOKEN, media), 20)
 
     def test_qd_cap_eight_slower_than_512(self):
         bytes_ = SIZE_70B_TOKEN
@@ -565,6 +642,56 @@ class WorkingSetGpuOccupancyTest(unittest.TestCase):
             fitted.append(req)
         self.assertEqual(len(fitted), 3)
         self.assertEqual(half.block_table.get_num_blocks(0), 1)
+
+
+class WorkingSetSpillWriteTest(unittest.TestCase):
+    def test_gpu_frac_one_spill_is_zero(self):
+        cost = spill_cost(512, _hbm_only_config(), SIZE_PER_TOKEN)
+        self.assertEqual(cost.latency, 0.0)
+        self.assertEqual(cost.dram_bytes, 0)
+        self.assertEqual(cost.ssd_bytes, 0)
+
+    def test_spill_matches_cold_set_and_pcie_max(self):
+        config = _hier_config()
+        cost = spill_cost(100, config, SIZE_PER_TOKEN)
+        self.assertEqual((cost.dram_tokens, cost.ssd_tokens), (50, 20))
+        t_dram = media_access_latency(cost.dram_bytes, config.dram, write=True)
+        t_ssd = media_access_latency(cost.ssd_bytes, config.ssd, write=True)
+        t_pcie = (cost.dram_bytes + cost.ssd_bytes) / _GB / config.pcie_bw_gbps
+        self.assertAlmostEqual(cost.latency, max(t_dram, t_ssd, t_pcie))
+
+    def test_narrow_pcie_raises_spill(self):
+        wide = _hier_config()
+        narrow = WorkingSetConfig(
+            enabled=True,
+            placement="sliding_window",
+            gpu_frac=HIER_FRACS[0],
+            dram_frac=HIER_FRACS[1],
+            ssd_frac=HIER_FRACS[2],
+            overlap="blocking",
+            pcie_bw_gbps=0.2,
+            dram=MediaReadConfig(read_latency_us=100.0, read_bw_gbps=50.0),
+            ssd=MediaReadConfig(read_latency_us=100.0, read_bw_gbps=7.0),
+        )
+        self.assertGreater(
+            spill_cost(100, narrow, SIZE_PER_TOKEN).latency,
+            spill_cost(100, wide, SIZE_PER_TOKEN).latency,
+        )
+
+    def test_prefill_request_with_decode_pays_spill(self):
+        config = _hier_config()
+        req = _LatencyRequest(prefill_len=99, generation_idx=0, is_prefill=True)
+        req.decode_len = 16
+        cost = spill_cost_for_requests([req], config, SIZE_PER_TOKEN)
+        expected = spill_cost(100, config, SIZE_PER_TOKEN)
+        self.assertAlmostEqual(cost.latency, expected.latency)
+
+    def test_prefill_without_remaining_decode_skips_spill(self):
+        config = _hier_config()
+        req = _LatencyRequest(prefill_len=99, generation_idx=0, is_prefill=True)
+        req.decode_len = 1
+        cost = spill_cost_for_requests([req], config, SIZE_PER_TOKEN)
+        self.assertEqual(cost.latency, 0.0)
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ from TokenSim.kv_transfer import (
     P2PConnector,
 )
 from TokenSim.kv_working_set.config import WorkingSetConfig
+from TokenSim.kv_working_set.fetch import spill_cost_for_requests
 from TokenSim.kv_working_set.placement import gpu_resident_blocks
 from TokenSim.latency import build_latency_backend
 from TokenSim.llm.llm_request import Request, RequestStatus
@@ -167,6 +168,7 @@ class LLMWorker(Worker):
         super().__init__(env, id)
         self.roofline = roofline
         self.engine = engine
+        self.working_set_config = working_set_config
 
         self.role = worker_config.role
         self.hardware = worker_config.hardware
@@ -409,7 +411,27 @@ class LLMWorker(Worker):
                 self.send_task(self.engine, Task.STOP)
 
     def dynamic_batch(self, requests: list[Request]) -> float:
-        return self.latency_backend.estimate_step_latency(requests)
+        latency = self.latency_backend.estimate_step_latency(requests)
+        return latency + self._working_set_spill_latency(requests)
+
+    def _working_set_spill_latency(self, requests: list[Request]) -> float:
+        config = self.working_set_config
+        if config is None or not config.enabled or config.gpu_frac >= 1.0:
+            return 0.0
+        cost = spill_cost_for_requests(
+            requests,
+            config,
+            self.cache_config.size_per_token,
+        )
+        if cost.latency <= 0.0:
+            return 0.0
+        stats = getattr(self.latency_backend, "kv_ws_stats", None)
+        if stats is None:
+            fallback = getattr(self.latency_backend, "fallback_backend", None)
+            stats = getattr(fallback, "kv_ws_stats", None)
+        if stats is not None:
+            stats.record_spill(cost)
+        return cost.latency
 
 
 class LLMEngine(Worker):

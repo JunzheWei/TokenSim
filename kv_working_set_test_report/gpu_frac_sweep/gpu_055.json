@@ -4,7 +4,8 @@
   "gpu_frac": 0.55,
   "dram_frac": 0.3214285714285714,
   "ssd_frac": 0.12857142857142856,
-  "overlap": "blocking",
+  "overlap": "layer_prefetch",
+  "pcie_bw_gbps": 50.0,
   "dram": {
     "read_latency_us": 2.0,
     "read_bw_gbps": 50.0
@@ -12,7 +13,7 @@
   "ssd": {
     "read_latency_us": 13.0,
     "read_bw_gbps": 14.0,
-    "io_size_bytes": 4096,
+    "io_size_bytes": 131072,
     "qd_cap": 32,
     "qd_latency_us": [
       [

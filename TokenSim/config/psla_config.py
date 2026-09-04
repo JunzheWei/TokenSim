@@ -122,6 +122,9 @@ class LLMResult:
     kv_ws_ssd_read_tokens: int = 0
     kv_ws_dram_ios: int = 0
     kv_ws_ssd_ios: int = 0
+    kv_ws_spill_latency: float = 0.0
+    kv_ws_dram_write_bytes: int = 0
+    kv_ws_ssd_write_bytes: int = 0
 
     @classmethod
     def from_file(cls, filename):

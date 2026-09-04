@@ -1,0 +1,27 @@
+request_time=MetricData(p50=31.495247422383954, p99=35.848891693262395, max=36.51578501640188)
+prefill_time=MetricData(p50=0.098560600558244, p99=0.14148846178830812, max=0.14659218793849504)
+decode_time=MetricData(p50=0.061175966243547944, p99=0.06988428538198592, max=0.070306350283556)
+decode_max_time=MetricData(p50=0.1467046440343296, p99=0.16386841923622342, max=0.16386841923622342)
+prefill_idle_time=MetricData(p50=0.2321093167819202, p99=0.4508564300171057, max=0.45153117236255147)
+decode_idle_time=MetricData(p50=0.0027327782518658528, p99=0.011495917609253533, max=0.01210686948955475)
+Average prefill latency: 0.1031710965224454
+Max prefill latency: 0.14659218793849504
+Min prefill latency: 0.07147696396350511
+Average decode latency: 0.06177782263842329
+Max decode latency: 0.070306350283556
+Min decode latency: 0.06002354350780415
+total time: 2327.9418529064455
+Thoughput: 0.042956399394232965 r/s, 22.00484515368978 token/s
+Total preemptions: 0
+Prefix cache: hit_blocks=0, miss_blocks=0, hit_tokens=0, effective_prefill_tokens=51226, hit_rate=0
+KV connector: transfers=0, blocks=0, bytes=0, latency=0.0, load_wait=0.0, save_wait=0.0
+Parallel: config={'tensor_parallel_size': 1, 'pipeline_parallel_size': 1, 'data_parallel_size': 1, 'data_parallel_rank': 0, 'data_parallel_size_local': 1, 'tensor_parallel_collective_latency_scale': 1.0, 'pipeline_parallel_activation_latency_scale': 1.0, 'enable_expert_parallel': False, 'expert_placement_strategy': 'linear', 'all2all_backend': 'allgather_reducescatter'}, ranks=1/1, dp_placements={}, sync_events=0, sync_latency=0.0
+MoE: disabled
+KV working set: placement=sliding_window, gpu_frac=0.8, dram_frac=0.14285714285714282, ssd_frac=0.057142857142857134, fetch_latency=673.047299433034, dram_read_bytes=14639919267840, ssd_read_bytes=6016792002560, dram_ios=51126, ssd_ios=45904480, spill_latency=0.5287388392857137
+Prefill SLO Good Throughput: 100 r, 0.042956399394232965 r/s
+Max-Decode SLO Good Throughput: 89 r, 0.03823119546086734 r/s
+Prefill and Max-Decode SLO Good Throughput: 89 r, 0.03823119546086734 r/s
+Decode SLO Good Throughput: 100 r, 0.042956399394232965 r/s
+Prefill and Decode SLO Good Throughput: 100 r, 0.042956399394232965 r/s
+/home/kewei/.local/lib/python3.11/site-packages/simpy/__init__.py:11: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import get_distribution

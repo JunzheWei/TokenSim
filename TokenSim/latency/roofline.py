@@ -4,8 +4,12 @@ import copy
 from typing import Any
 
 from TokenSim.config.config import ParallelConfig, ParallelRankInfo, _GB
+from TokenSim.config.cache_config import stage_layer_count
 from TokenSim.kv_working_set.config import WorkingSetConfig
-from TokenSim.kv_working_set.fetch import decode_fetch_for_requests
+from TokenSim.kv_working_set.fetch import (
+    decode_fetch_for_requests,
+    layer_prefetch_step_latency,
+)
 from TokenSim.kv_working_set.stats import WorkingSetStats
 from TokenSim.latency.base import (
     DECODE_SCALE,
@@ -127,7 +131,42 @@ class RooflineLatencyBackend(LatencyBackend):
         total_time += self._parallel_sync_latency(requests)
         if is_context_build:
             return total_time * PREFILL_SCALE + PREFILL_OFFSET_SECONDS
-        return total_time * DECODE_SCALE + self.working_set_fetch_latency(requests)
+        return self.combine_decode_latency(total_time * DECODE_SCALE, requests)
+
+    def combine_decode_latency(
+        self,
+        compute: float,
+        requests: list[Request],
+    ) -> float:
+        fetch = self.working_set_fetch_latency(requests)
+        config = self.working_set_config
+        if (
+            config is not None
+            and config.enabled
+            and config.overlap == "layer_prefetch"
+        ):
+            return layer_prefetch_step_latency(
+                compute,
+                fetch,
+                self._decode_n_layers(),
+            )
+        return compute + fetch
+
+    def _decode_n_layers(self) -> int:
+        models = getattr(self.roofline, "models", None)
+        model_config = None
+        if models is not None:
+            for key in (self.roofline_model, self.model):
+                try:
+                    model_config = models[key]
+                    break
+                except (KeyError, TypeError, AttributeError):
+                    continue
+        n = int(getattr(model_config, "Nlayer", 1) or 1)
+        pp = max(1, int(self.parallel_config.pipeline_parallel_size))
+        if pp <= 1:
+            return max(1, n)
+        return max(1, stage_layer_count(n, pp, self.rank_info.pp_rank))
 
     def working_set_fetch_latency(self, requests: list[Request]) -> float:
         config = self.working_set_config

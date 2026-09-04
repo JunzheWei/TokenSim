@@ -43,7 +43,10 @@ class LLMCompassLatencyBackend(LatencyBackend):
             requests[0], "needs_recompute", False
         )
         if not is_context_build:
-            latency += self.fallback_backend.working_set_fetch_latency(requests)
+            latency = self.fallback_backend.combine_decode_latency(
+                latency,
+                requests,
+            )
         return latency
 
     def _estimate_llmcompass(self, requests: list[Request]) -> float:
