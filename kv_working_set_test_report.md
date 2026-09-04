@@ -31,9 +31,9 @@ Working-set media (`data/kv_working_set/hier_30_50_20.json`):
 | DRAM | 0.5 | **2 µs** (PCIe DMA) | **50 GB/s** | Yes |
 | SSD | 0.2 (oldest) | **100 µs** (NVMe) | **7 GB/s** | Yes |
 
-v1 decode step: `T_step = T_roofline + T(dram_miss) + T(ssd_miss)` (page-fault, not a full cold-set read every token). Prefill / recompute do **not** add fetch. GPU occupancy is **not** reduced by `gpu_frac`.
+v1 decode step: `T_step = T_roofline + T(dram_miss) + T(ssd_miss)` (page-fault, not a full cold-set read every token). Prefill / recompute do **not** add fetch. GPU occupancy **is** reduced by `gpu_frac`: only `floor(S * gpu_frac)` tokens charge HBM blocks (see §8).
 
-v1 decode：缺页读取，不是每步把冷 KV 全量再读。Prefill / 重算不加 fetch。`gpu_frac` **不减少** GPU KV 占用。
+v1 decode：缺页读取，不是每步把冷 KV 全量再读。Prefill / 重算不加 fetch。`gpu_frac` **会减少** GPU KV 占用：HBM 只按 `floor(S * gpu_frac)` 计块（见 §8）。
 
 ---
 
@@ -63,7 +63,7 @@ GPU 字节 = `MM_Card_Num × Capacity × 2^30`。若 `gpu_bytes <= W`，直接 `
 | + one request S=1024 (prefill+decode ~512+512) | **123.26 GiB** | One full request in this test |
 | + one request S=4096 (`Max_Token`) | 130.76 GiB | Still fits 141 GiB |
 | **This H200 leftover for KV** | **141 − 120.763 = 20.237 GiB** | ≈ **8288 tokens** ≈ **518** blocks of 16 |
-| Concurrent S=1024 requests in leftover | **8** | 100 burst requests ⇒ GPU cache overflow ⇒ preempt/recompute |
+| Concurrent S=1024 requests in leftover (`gpu_frac=1`) | **8** | 100 burst requests ⇒ GPU cache overflow ⇒ preempt/recompute |
 
 **Practical minimum for this test (one in-flight 70B request ~1k context):** about **123 GiB** HBM. **Minimum for the process to start:** just over **120.76 GiB**. H200 141 GiB is enough for weights + a short KV window, **not** for 100 concurrent full contexts — both arms preempted ~73 times.
 
@@ -96,9 +96,9 @@ python3.11 ./benchmark.py --batching paged-attn --qps 10 \
 
 ### Case 2 (official) — burst, hierarchical 30/50/20 / 正式用例：burst 分层
 
-Same arrival and cluster. Page-fault DRAM/SSD reads on decode (cold tail once, then window slide).
+Same arrival and cluster. Page-fault DRAM/SSD reads on decode (cold tail once, then window slide). **Current code also caps GPU blocks at `gpu_frac=0.3`.** The JSON in §5 was captured **before** occupancy capping (73 preemptions, 287 tok/s). Re-run numbers match §8 `gpu_frac=30%` (46 preemptions, 707 tok/s).
 
-到达与集群相同。Decode 缺页读 DRAM/SSD（冷尾一次，之后只跟窗口滑动）。
+到达与集群相同。Decode 缺页读 DRAM/SSD。**当前代码还会按 `gpu_frac=0.3` 限制 GPU 块。** §5 的 JSON 是占用限制之前的快照（73 次抢占，287 tok/s）。重跑应与 §8 的 30% 行一致（46 次抢占，707 tok/s）。
 
 ```bash
 python3.11 ./benchmark.py --batching paged-attn --qps 10 \
@@ -243,21 +243,70 @@ Full-read-every-step charged `T(dram)+T(ssd)` for the whole cold set on **every*
 
 每步全量读会对每个 decode token 收取整段冷 KV，大约慢 12 倍。缺页在请求上保留水位 `kv_ws_fetched_end`：存储区是 `[0, gpu_start)`，只对尚未读过的 `[fetched_end, gpu_start)` 计时。
 
-After this change, hierarchical **nearly matches** all-GPU speed (~2%). It still does **not** save HBM: both arms preempt 73 times. Offload’s remaining benefit vs all-GPU would be serving a longer context / higher concurrency than 20 GiB KV allows — that needs `gpu_frac` to cap GPU blocks (not in this run).
+After this change, hierarchical **fetch-only** (occupancy still full GPU) nearly matched all-GPU speed (~2%). Capping GPU blocks with `gpu_frac` is the occupancy sweep in §8: 30/50/20 then reaches **707 tok/s** and 46 preemptions, not the fetch-only 287 tok/s / 73 preemptions in §5.
 
-改完后分层与全 GPU **几乎追平**（约 2%）。显存占用仍未减少，两臂都抢占 73 次。若要在「全 GPU 放不下」时体现 offload 好处，还需要用 `gpu_frac` 限制 GPU 块数（本次未做）。
+缺页之后，若占用仍按全 GPU 计，分层与全 GPU **几乎追平**（约 2%）。用 `gpu_frac` 限制 GPU 块之后见 §8：30/50/20 变为 **707 tok/s**、抢占 46，而不是 §5 里只加 fetch 的 287 tok/s / 73 次抢占。
 
 ---
 
-## 8. Reproduce / 复现
+## 8. gpu_frac occupancy sweep / 占用扫描
 
-Python 3.11, repo root. Commands in §3.
+`gpu_frac` now charges only `floor(S * gpu_frac)` tokens of GPU blocks (`gpu_resident_blocks` in `BlockManager`). Remainder of `(1 - gpu_frac)` is split DRAM:SSD = 5:2, same media as `hier_30_50_20.json`. Burst recipe unchanged. DRAM/SSD **capacity** is still infinite.
+
+`gpu_frac` 现在只把 `floor(S * gpu_frac)` 个 token 计入 GPU block。其余按 DRAM:SSD = 5:2 拆分。Burst 与正式用例相同。DRAM/SSD **容量**仍无限。
+
+Peak decode concurrency at S=1024 is leftover blocks after watermark (`513`) / `ceil(floor(1024*gpu_frac)/16)`.
+
+| gpu_frac | Peak B (S=1024) | token/s | vs 100% | TPOT p50 | per-user | TTFT p50 | makespan | preempt | Σ fetch |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100% | 8 | 292.0 | 1.00× | 69.0 ms | 14.5 | 141.9 s | 350.9 s | 73 | 0 |
+| 95% | 8 | 292.6 | 1.00× | 69.8 ms | 14.3 | 142.3 s | 350.1 s | 72 | 0.52 s |
+| 90% | 8 | 320.7 | 1.10× | 70.3 ms | 14.2 | 142.0 s | 319.4 s | 64 | 0.99 s |
+| 85% | 9 | 321.2 | 1.10× | 71.0 ms | 14.1 | 110.2 s | 318.9 s | 65 | 1.47 s |
+| 80% | 9 | 351.5 | 1.20× | 72.0 ms | 13.9 | 111.4 s | 291.5 s | 65 | 1.94 s |
+| 75% | 10 | 352.9 | 1.21× | 72.9 ms | 13.7 | 112.4 s | 290.3 s | 66 | 2.41 s |
+| 70% | 11 | 390.0 | 1.34× | 74.2 ms | 13.5 | 112.8 s | 262.7 s | 63 | 2.89 s |
+| 65% | 12 | 391.0 | 1.34× | 75.3 ms | 13.3 | 79.9 s | 262.0 s | 65 | 3.36 s |
+| 60% | 13 | 438.5 | 1.50× | 76.8 ms | 13.0 | 80.7 s | 233.7 s | 64 | 3.84 s |
+| 55% | 14 | 441.8 | 1.51× | 78.9 ms | 12.7 | 81.3 s | 231.9 s | 64 | 4.32 s |
+| 50% | 16 | 503.7 | 1.73× | 80.8 ms | 12.4 | 82.1 s | 203.4 s | 57 | 4.78 s |
+| 45% | 17 | 503.7 | 1.73× | 83.0 ms | 12.0 | 78.3 s | 203.4 s | 63 | 5.26 s |
+| 40% | 19 | 589.1 | 2.02× | 86.0 ms | 11.6 | 47.8 s | 173.9 s | 54 | 5.74 s |
+| 35% | 22 | 589.9 | 2.02× | 89.7 ms | 11.1 | 48.9 s | 173.7 s | 57 | 6.22 s |
+| **30%** | **25** | **706.6** | **2.42×** | 93.4 ms | 10.7 | **2.94 s** | 145.0 s | 46 | 6.68 s |
+| 25% | 32 | 712.3 | 2.44× | 99.9 ms | 10.0 | 3.51 s | 143.8 s | 50 | 7.16 s |
+| 20% | 39 | 828.1 | 2.84× | 109.9 ms | 9.1 | 4.20 s | 123.7 s | 41 | 7.64 s |
+| 15% | 51 | 899.2 | 3.08× | 128.3 ms | 7.8 | 5.77 s | 113.9 s | 49 | 8.12 s |
+| 10% | 73 | 1063.5 | 3.64× | 144.1 ms | 6.9 | 5.77 s | 96.3 s | 26 | 8.59 s |
+
+**EN.** System token/s and TTFT improve because more requests share the GPU; TPOT and per-user tok/s worsen because decode batches are larger (attention is summed) and fetch grows. Σ fetch is still small vs makespan. The staircase (95≈100, 90≈85, …) is GPU **block** rounding, not 5% itself.
+
+**中文。** 系统 token/s 和 TTFT 变好是因为并发上去、排队缩短；TPOT 和单流变差是因为 decode batch 变大（attention 逐条相加）以及 fetch 增加。Σ fetch 相对 makespan 仍然很小。台阶来自 **block** 取整，不是 5% 本身有特殊意义。
+
+At `gpu_frac=15%` and `10%`, TTFT p50 = p99 = 5.77 s: all 100 prompts fit in the first packed prefill.
+
+`gpu_frac=15%` 和 `10%` 时 TTFT p50=p99=5.77 s：100 条 prompt 都能进第一波 packed prefill。
+
+Figures: [`gpu_frac_inference_speed.md`](gpu_frac_inference_speed.md) (token/s chart includes peak B).
+
+```bash
+python3.11 kv_working_set_test_report/gpu_frac_sweep/run_sweep.py
+python3.11 kv_working_set_test_report/gpu_frac_sweep/plot_gpu_frac.py
+```
+
+---
+
+## 9. Reproduce / 复现
+
+Python 3.11, repo root. Official two-arm commands in §3. Occupancy sweep in §8.
 
 | Artifact | Path |
 | --- | --- |
 | Burst all-GPU JSON | [`kv_working_set_test_report/all_gpu_burst.json`](kv_working_set_test_report/all_gpu_burst.json) |
-| Burst hierarchical JSON | [`kv_working_set_test_report/hier_burst.json`](kv_working_set_test_report/hier_burst.json) |
+| Burst hierarchical JSON (fetch-only, pre-occupancy) | [`kv_working_set_test_report/hier_burst.json`](kv_working_set_test_report/hier_burst.json) |
+| gpu_frac inference-speed MD | [`gpu_frac_inference_speed.md`](gpu_frac_inference_speed.md) |
 | Figure 1–3 PNG | [`fig_slowdown.png`](kv_working_set_test_report/fig_slowdown.png), [`fig_ttft_tpot.png`](kv_working_set_test_report/fig_ttft_tpot.png), [`fig_tokens.png`](kv_working_set_test_report/fig_tokens.png) |
-| Interactive canvas (same burst numbers) | [TTFT / TPOT / token/s](/home/kewei/.cursor/projects/home-kewei-projects-TokenSim/canvases/ttft-tpot-working-set.canvas.tsx) |
+| Canvas (fetch-only 30/50/20) | [TTFT / TPOT / token/s](/home/kewei/.cursor/projects/home-kewei-projects-TokenSim/canvases/ttft-tpot-working-set.canvas.tsx) |
+| Canvas (occupancy sweep) | [gpu_frac occupancy sweep](/home/kewei/.cursor/projects/home-kewei-projects-TokenSim/canvases/gpu-frac-occupancy-sweep.canvas.tsx) |
 
 设计说明见 [offload_sim.md](offload_sim.md)。

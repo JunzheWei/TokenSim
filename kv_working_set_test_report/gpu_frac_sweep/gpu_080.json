@@ -1,0 +1,20 @@
+{
+  "enabled": true,
+  "placement": "sliding_window",
+  "gpu_frac": 0.8,
+  "dram_frac": 0.14285714285714282,
+  "ssd_frac": 0.057142857142857134,
+  "overlap": "blocking",
+  "dram": {
+    "read_latency_us": 2.0,
+    "read_bw_gbps": 50.0
+  },
+  "ssd": {
+    "read_latency_us": 100.0,
+    "read_bw_gbps": 7.0
+  },
+  "hbm": {
+    "read_latency_us": 0.0,
+    "read_bw_gbps": 2000.0
+  }
+}

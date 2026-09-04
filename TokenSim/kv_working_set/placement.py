@@ -20,6 +20,21 @@ class ContextSplit:
         return self.gpu + self.dram + self.ssd
 
 
+def gpu_resident_tokens(context_len: int, gpu_frac: float) -> int:
+    """Newest tokens kept on GPU; matches ``split_context`` GPU count."""
+    return floor(max(0, int(context_len)) * gpu_frac)
+
+
+def gpu_resident_blocks(context_len: int, block_size: int, gpu_frac: float) -> int:
+    """GPU KV blocks charged for ``context_len`` tokens at ``gpu_frac``."""
+    if block_size <= 0:
+        return 0
+    tokens = gpu_resident_tokens(context_len, gpu_frac)
+    if tokens <= 0:
+        return 0
+    return (tokens + block_size - 1) // block_size
+
+
 def split_context(context_len: int, config: WorkingSetConfig) -> ContextSplit:
     """Split live context tokens across GPU / DRAM / SSD.
 

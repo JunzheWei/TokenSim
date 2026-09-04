@@ -161,6 +161,7 @@ class LLMPagedAttnScheduler(LLMScheduler):
         max_parallem_sum=None,
         max_occupy_ratio: float = 1,
         connector=None,
+        gpu_frac: float = 1.0,
     ):
         super().__init__(connector=connector)
 
@@ -173,6 +174,7 @@ class LLMPagedAttnScheduler(LLMScheduler):
             num_gpu_blocks=self.cache_config.num_gpu_blocks,
             num_cpu_blocks=self.cache_config.num_cpu_blocks,
             model=self.cache_config.model,
+            gpu_frac=gpu_frac,
         )
 
         self.max_occupy_ratio = max_occupy_ratio

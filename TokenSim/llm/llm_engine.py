@@ -27,6 +27,7 @@ from TokenSim.kv_transfer import (
     P2PConnector,
 )
 from TokenSim.kv_working_set.config import WorkingSetConfig
+from TokenSim.kv_working_set.placement import gpu_resident_blocks
 from TokenSim.latency import build_latency_backend
 from TokenSim.llm.llm_request import Request, RequestStatus
 from TokenSim.llm.llm_scheduler import (
@@ -245,6 +246,10 @@ class LLMWorker(Worker):
             self.cache_config,
         )
 
+        ws_gpu_frac = 1.0
+        if working_set_config is not None and working_set_config.enabled:
+            ws_gpu_frac = working_set_config.gpu_frac
+
         if batching == "paged-attn":
             self.scheduler = LLMPagedAttnScheduler(
                 self.id,
@@ -252,6 +257,7 @@ class LLMWorker(Worker):
                 max_parallem_sum=max_parallem_sum,
                 max_occupy_ratio=max_occupy_ratio if self.role != "prefill" else 1,
                 connector=self.connector,
+                gpu_frac=ws_gpu_frac,
             )
         elif batching == "static":
             self.scheduler = LLMStaticScheduler(
@@ -496,17 +502,23 @@ class LLMEngine(Worker):
         self.debug_printer.record(event, request, self.env.now)
 
     def validate_request_capacity(self, requests: list[Request]) -> None:
+        gpu_frac = 1.0
+        if self.working_set_config is not None and self.working_set_config.enabled:
+            gpu_frac = self.working_set_config.gpu_frac
         role_pools = (
             (
                 "prefill",
                 self.prefill_workers.workers,
-                lambda req: req.num_logical_token_blocks,
+                lambda req: gpu_resident_blocks(
+                    req.prefill_len, req.block_size, gpu_frac
+                ),
             ),
             (
                 "decode",
                 self.decode_workers.workers,
-                lambda req: (req.prefill_len + req.decode_len + req.block_size - 1)
-                // req.block_size,
+                lambda req: gpu_resident_blocks(
+                    req.prefill_len + req.decode_len, req.block_size, gpu_frac
+                ),
             ),
         )
         for role, workers, required_blocks in role_pools:

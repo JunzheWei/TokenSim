@@ -4,6 +4,7 @@ from TokenSim.block.block_pool import BlockPool
 from TokenSim.block.block_table import BlockTable
 from TokenSim.block.kv_cache_manager import KVCacheManager, PrefixReusePlan
 from TokenSim.errors import OutOfBlocksError, SimulationStateError
+from TokenSim.kv_working_set.placement import gpu_resident_blocks
 from typing import Tuple
 
 
@@ -100,10 +101,12 @@ class BlockManager:
         num_cpu_blocks: int,
         model: str = "unknown",
         watermark: float = 0.01,
+        gpu_frac: float = 1.0,
     ):
         self.block_size = block_size
         self.num_total_gpu_blocks = num_gpu_blocks
         self.num_total_cpu_blocks = num_cpu_blocks
+        self.gpu_frac = gpu_frac
 
         self.block_table = BlockTable()
         self.kv_cache_manager = KVCacheManager(block_size=block_size, model=model)
@@ -118,7 +121,17 @@ class BlockManager:
         self.cpu_allocator = BlockAllocator(Device.CPU, block_size, num_cpu_blocks)
         self._reserved_gpu_blocks: list[PhysicalTokenBlock] = []
 
+    def _constrain_gpu_occupancy(self) -> bool:
+        return self.gpu_frac < 1.0
+
+    def _gpu_target_blocks(self, req: Request) -> int:
+        return gpu_resident_blocks(req.context_len, self.block_size, self.gpu_frac)
+
     def can_allocate(self, req: Request) -> bool:
+        if self._constrain_gpu_occupancy():
+            num_required_blocks = self._gpu_target_blocks(req)
+            num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks()
+            return num_free_gpu_blocks - num_required_blocks >= self.watermark_blocks
         plan = self.kv_cache_manager.plan_reuse(req)
         num_required_blocks = plan.miss_block_count
         num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks()
@@ -129,6 +142,12 @@ class BlockManager:
 
     def allocate(self, req: Request):
         # Allocate new physical token blocks that will store the prompt&generated tokens.
+        if self._constrain_gpu_occupancy():
+            needed = self._gpu_target_blocks(req)
+            blocks = [self.gpu_allocator.allocate() for _ in range(needed)]
+            self.block_table.add_blocks(req.id, blocks)
+            self._sync_request_blocks(req, blocks)
+            return
         plan = self.kv_cache_manager.plan_reuse(req)
         self.kv_cache_manager.apply_plan(req, plan)
 
@@ -170,16 +189,21 @@ class BlockManager:
         req._physical_token_blocks.clear()
         self.kv_cache_manager.forget_request(req.id)
 
+    def _append_target_blocks(self, req: Request) -> int:
+        if self._constrain_gpu_occupancy():
+            return self._gpu_target_blocks(req)
+        return req.num_logical_token_blocks
+
     def can_append_slot(self, req: Request, reserved_blocks: int = 0) -> bool:
         required_blocks = int(
-            self.block_table.get_num_blocks(req.id) < req.num_logical_token_blocks
+            self.block_table.get_num_blocks(req.id) < self._append_target_blocks(req)
         )
         num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks()
         return num_free_gpu_blocks >= required_blocks + reserved_blocks
 
     def append_slot(self, req: Request):
         """Allocate a physical slot for a new token."""
-        if self.block_table.get_num_blocks(req.id) < req.num_logical_token_blocks:
+        if self.block_table.get_num_blocks(req.id) < self._append_target_blocks(req):
             # The request has a new logical block, which
             # happens in Scheduler.update_output_tokens().
             # Allocate a new physical block.

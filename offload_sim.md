@@ -44,9 +44,10 @@ TokenSim 对 (1) 和 Mooncake 式 **prefix 归档**（给后续请求复用）�
 | Path / 路径 | What TokenSim does today / 现状 | Relation / 关系 |
 | --- | --- | --- |
 | Roofline / LLMCompass decode | Assumes **all KV on HBM** / 假定 KV 全在 HBM | Need additive `T_fetch` / 需要叠加读取时延 |
-| GPU full / 显存满 | `can_append_slot` fails → preempt + recompute | Keep as **baseline arm** / 保留作对照臂 |
+| GPU full / 显存满 | `can_append_slot` fails → preempt + recompute | Baseline when `gpu_frac=1` / `gpu_frac=1` 时作对照 |
+| GPU occupancy / 占用 | `gpu_frac<1` charges `floor(S*gpu_frac)` GPU tokens | More concurrency; DRAM/SSD capacity infinite |
 | Mooncake store SSD | Prefill **prefix archive** / prefill 归档给后人 | **Orthogonal** / 正交，不要混用 |
-| CPU `BlockAllocator` | Allocated but unused on decode append | Optional later / v1 不用 |
+| CPU `BlockAllocator` | Allocated but unused on decode append | Not DRAM capacity / 不作 DRAM 容量 |
 
 **EN — critical distinction.**
 
@@ -148,7 +149,8 @@ not pre-marked resident, so the first decode still page-ins the cold tail.
 
 Notes / 说明:
 
-- Prefill and recompute stay all-GPU in v1 (no fetch). Prefill / 重算仍全 GPU。
+- Prefill and recompute stay all-GPU **for latency** in v1 (no fetch). Prefill / 重算时延仍全 GPU。
+  GPU **occupancy** still follows `gpu_frac` so offloaded tokens do not consume HBM blocks.
 - v1 does **not** subtract off-GPU KV from HBM attention in the roofline
   (pessimistic double-count). Phase 2 再从 HBM attention 里扣掉不在 GPU 的流量。
 - Spill / write-back is phase 2. 新 token 把旧块挤出 GPU 的写回是 phase 2。
@@ -326,6 +328,7 @@ Reuse `data/clusters/1_h200/h1.json` + `data/psla/llama-70b.json` + `paged-attn`
 - Write / spill modeling
 - `compute_overlap` (`max(T_roofline, T_fetch)`)
 - Shared PCIe / NVMe queue contention
+- DRAM / SSD **capacity** limits (only GPU HBM blocks are finite)
 
 ---
 

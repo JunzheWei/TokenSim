@@ -3,14 +3,19 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
+from TokenSim.block.block_manager import BlockManager
 from TokenSim.config.config import ParallelConfig
-from TokenSim.config.constants import _GB
 from TokenSim.errors import ConfigurationError
 from TokenSim.kv_working_set.config import MediaReadConfig, WorkingSetConfig
-from TokenSim.kv_working_set.fetch import fetch_cost, media_read_latency
-from TokenSim.kv_working_set.placement import split_context
+from TokenSim.kv_working_set.fetch import fetch_cost
+from TokenSim.kv_working_set.placement import (
+    gpu_resident_blocks,
+    gpu_resident_tokens,
+    split_context,
+)
 from TokenSim.latency import LLMCompassLatencyBackend, RooflineLatencyBackend
 from TokenSim.latency.base import DECODE_SCALE
+from TokenSim.llm.llm_request import Request
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -351,6 +356,42 @@ class WorkingSetLatencyBackendTest(unittest.TestCase):
         observed = hierarchical.estimate_step_latency([request])
         roofline_decode = observed - fetch
         self.assertAlmostEqual(roofline_decode, 0.011 * DECODE_SCALE)
+
+
+class WorkingSetGpuOccupancyTest(unittest.TestCase):
+    def test_resident_blocks_match_floor_frac(self):
+        self.assertEqual(gpu_resident_tokens(1024, 0.3), 307)
+        self.assertEqual(gpu_resident_blocks(1024, 16, 0.3), 20)
+        self.assertEqual(gpu_resident_blocks(1024, 16, 1.0), 64)
+        self.assertEqual(gpu_resident_blocks(512, 16, 0.1), 4)
+
+    def test_half_frac_fits_twice_as_many_requests(self):
+        def make_req(req_id: int) -> Request:
+            return Request(id=req_id, prefill_len=32, decode_len=1, block_size=16)
+
+        full = BlockManager(
+            block_size=16, num_gpu_blocks=4, num_cpu_blocks=8, gpu_frac=1.0
+        )
+        half = BlockManager(
+            block_size=16, num_gpu_blocks=4, num_cpu_blocks=8, gpu_frac=0.5
+        )
+        full_fit = 0
+        while True:
+            req = make_req(full_fit)
+            if not full.can_allocate(req):
+                break
+            full.allocate(req)
+            full_fit += 1
+        half_fit = 0
+        while True:
+            req = make_req(100 + half_fit)
+            if not half.can_allocate(req):
+                break
+            half.allocate(req)
+            half_fit += 1
+        self.assertEqual(full_fit, 2)
+        self.assertEqual(half_fit, 4)
+        self.assertEqual(half.block_table.get_num_blocks(100), 1)
 
 
 if __name__ == "__main__":
