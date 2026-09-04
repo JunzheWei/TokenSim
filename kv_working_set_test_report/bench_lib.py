@@ -86,7 +86,20 @@ def run_benchmark(
     return json.loads((results_dir / result_filename(qps)).read_text())
 
 
+_SPILL_RESULT_KEYS = (
+    "kv_ws_spill_latency",
+    "kv_ws_dram_write_bytes",
+    "kv_ws_ssd_write_bytes",
+)
+
+
 def metrics_from_result(result: dict, offered_qps: float) -> dict:
+    missing = [key for key in _SPILL_RESULT_KEYS if key not in result]
+    if missing:
+        raise KeyError(
+            "result JSON missing spill fields "
+            f"{missing}; re-run benchmark.py so LLMResult persists them"
+        )
     tpot = result["decode_time"]["p50"]
     request_p50 = result["request_time"]["p50"]
     return {
@@ -106,13 +119,13 @@ def metrics_from_result(result: dict, offered_qps: float) -> dict:
         "recomputation_count": result["recomputation_count"],
         "recomputed_tokens": result.get("recomputed_tokens", 0),
         "kv_ws_fetch_latency": result.get("kv_ws_fetch_latency", 0.0),
-        "kv_ws_spill_latency": result.get("kv_ws_spill_latency", 0.0),
+        "kv_ws_spill_latency": result["kv_ws_spill_latency"],
         "kv_ws_dram_read_tokens": result.get("kv_ws_dram_read_tokens", 0),
         "kv_ws_ssd_read_tokens": result.get("kv_ws_ssd_read_tokens", 0),
         "kv_ws_dram_ios": result.get("kv_ws_dram_ios", 0),
         "kv_ws_ssd_ios": result.get("kv_ws_ssd_ios", 0),
-        "kv_ws_dram_write_bytes": result.get("kv_ws_dram_write_bytes", 0),
-        "kv_ws_ssd_write_bytes": result.get("kv_ws_ssd_write_bytes", 0),
+        "kv_ws_dram_write_bytes": result["kv_ws_dram_write_bytes"],
+        "kv_ws_ssd_write_bytes": result["kv_ws_ssd_write_bytes"],
     }
 
 

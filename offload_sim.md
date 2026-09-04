@@ -143,10 +143,13 @@ until `T` hits bandwidth and drives with different `L1` look the same.
 粒度排队；正式配方是 **128KiB**，避免 4K 命令把顺序盘打成 IOPS 瓶颈。`qd_cap`
 决定延迟能否盖过带宽。
 
-GPU / HBM fraction uses the existing roofline (no separate HBM fetch in v1).
-HBM fields in config are optional metadata for phase 2.
+GPU / HBM fraction uses TransformerRoofline H200 (`BW_TBs=4.8`, i.e. **4.8 TB/s**).
+There is no separate HBM fetch in v1. Config `hbm.read_bw_gbps` is optional
+metadata and is **not** applied to `T_fetch` / `T_spill` (a JSON value of 2000
+does not throttle HBM).
 
-GPU 比例走现有 roofline，v1 不再单独加 HBM 读取。配置里的 `hbm` 供后续精度用。
+GPU 比例走 Roofline H200 的 **4.8 TB/s**，v1 不再单独加 HBM 读取。配置里的
+`hbm` 不计时延，不会把 HBM 节流到 2000 GB/s。
 
 ### 3.4 Step latency / 单步时延
 
@@ -254,7 +257,7 @@ Standalone JSON under `data/kv_working_set/`. Do **not** overload
 | `overlap` | yes | `blocking` or `layer_prefetch` (shipped default) |
 | `pcie_bw_gbps` | no | Host link for spill contention; default 50 |
 | `dram` / `ssd` | yes when frac > 0 | `read_latency_us` ≥ 0, `read_bw_gbps` > 0. Optional write fields default to the read values. Optional: `io_size_bytes` (0 = coalesced; shipped SSD is **128KiB**), `qd_cap` (≥ 1, default 32), `qd_latency_us` as `[qd, latency_us]` pairs. DRAM example is PCIe DMA (~2 µs, ~50 GB/s, coalesced). Shipped SSD is N3X-SLC **13 µs** / **14 GB/s** / 128KiB / `qd_cap=32`. Also `hier_n3x.json` (18 µs) and `hier_n3.json` (50 µs). |
-| `hbm` | no | Ignored in v1 latency / v1 不计时延 |
+| `hbm` | no | Ignored in v1 latency. GPU HBM bandwidth is Roofline **4.8 TB/s**, not this field. / v1 不计时延；HBM 带宽以 Roofline 4.8 TB/s 为准 |
 
 Shipped examples / 附带示例:
 

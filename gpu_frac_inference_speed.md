@@ -51,9 +51,9 @@ Peak B 变大伴随着更大的冷集，膝点 token/s 不会随占用上升。
 
 ![TTFT p50 and TPOT p50 vs gpu_frac](kv_working_set_test_report/gpu_frac_sweep/fig_ttft_tpot_frac.png)
 
-TPOT p50 rises as `gpu_frac` falls (63 ms → 311 ms at 30% → 430 ms at 25%). TTFT p50 stays sub-second at every knee — the burst p50 cliff is gone.
+TPOT p50 generally rises as `gpu_frac` falls (63 ms → 311 ms at 30% → 430 ms at 25%), then **drops** at 20% (100 ms) because that row's `λ*` falls to 0.02 and `N*` ≈ 1. Each point is at **its own knee**, not a fixed QPS, so TPOT is sawtoothed when the search steps down. TTFT p50 stays sub-second at every knee — the burst p50 cliff is gone.
 
-TPOT 随 `gpu_frac` 下降而变长。膝点 TTFT p50 都在 1 秒以内，没有 burst 悬崖。
+TPOT 大体随 `gpu_frac` 变长，但在 `λ*` 降档时会回落（轻载、几乎无排队）。膝点 TTFT p50 都在 1 秒以内，没有 burst 悬崖。
 
 ---
 
@@ -98,6 +98,10 @@ Prefill occupancy is full-context, so **B_prefill = 16** at S=512 for every `gpu
 | 20% | 39 | 0.02 | 1.02 | 22.1 | 100.0 ms | 0.11 s | 0.41 s | 0 |
 | 15% | 51 | 0.02 | 1.13 | 22.1 | 110.2 ms | 0.11 s | 0.46 s | 0 |
 | 10% | 73 | 0.02 | 1.29 | 22.1 | 129.7 ms | 0.13 s | 0.52 s | 0 |
+
+Each row is at that `gpu_frac`'s own `λ*`. When `λ*` steps down (25% → 20%: 0.04 → 0.02), `N*` falls **9.01 → 1.02** and TPOT returns to light-load (~100 ms). Same pattern at 70% → 65% and 60% → 55%. This is not a faster decode at lower HBM occupancy.
+
+各行在各自膝点采集。`λ*` 降档后并发掉到 ~1，SSD 争用消失，TPOT 回落；不是留更少显存单步更快。
 
 ```bash
 python3.11 kv_working_set_test_report/gpu_frac_sweep/run_sweep.py

@@ -245,7 +245,7 @@
     "recomputation_count": 0,
     "recomputed_tokens": 0,
     "recompute_service_time": 0.0,
-    "simulator_wall_time": 1.492790522002906,
+    "simulator_wall_time": 1.4776868830012972,
     "simulated_time": 1190.187218300729,
     "reuse_hit_blocks": 0,
     "reuse_miss_blocks": 0,
@@ -378,5 +378,8 @@
     "kv_ws_dram_read_tokens": 6992725,
     "kv_ws_ssd_read_tokens": 2850784,
     "kv_ws_dram_ios": 51126,
-    "kv_ws_ssd_ios": 57015680
+    "kv_ws_ssd_ios": 57015680,
+    "kv_ws_spill_latency": 0.6544712611607146,
+    "kv_ws_dram_write_bytes": 23904911360,
+    "kv_ws_ssd_write_bytes": 9838264320
 }

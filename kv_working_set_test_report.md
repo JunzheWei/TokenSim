@@ -16,6 +16,10 @@ Burst（t=0 同时 100 条）曾出现 TTFT p50 悬崖，那是 hybrid + prefill
 
 ## 1. Hardware and model / 硬件与模型
 
+This run uses **MHA-64** (~**2.50 MiB/token**). Production Llama-2-70B is typically **GQA-8** (~**0.31 MiB/token**, **1/8** the KV). I/O volume and throughput drop here are an MHA heavy-load bound; GQA pressure is much lower (GQA control is next-phase, §10).
+
+本期是 **MHA-64**（约 **2.50 MiB/token**）。真实 LLaMA-2-70B 多为 **GQA-8**（约 **0.31 MiB/token**，KV 为 **1/8**）。本报告的 I/O 瓶颈与吞吐下降代表 MHA 极端重载；GQA 下压力会显著降低（对照见第 10 节，本轮未跑）。
+
 | Item / 项 | Value / 值 |
 | --- | ---: |
 | Cluster | `data/clusters/1_h200/h1.json` — 1 hybrid worker, **H200** |
@@ -31,10 +35,14 @@ Working-set media (`data/kv_working_set/hier_30_50_20.json` = `hier_n3x_slc.json
 
 | Tier | Fraction | Latency | Bandwidth | Queue | Used? |
 | --- | ---: | ---: | ---: | --- | --- |
-| GPU / HBM | 0.3 (newest) | — | 2000 GB/s | — | Roofline compute |
+| GPU / HBM | 0.3 (newest) | — | **4.8 TB/s** (Roofline internal) | — | TransformerRoofline H200 `BW_TBs`; not working-set I/O |
 | DRAM | 0.5 | 2 µs | 50 GB/s | coalesced | Yes |
 | SSD | 0.2 (oldest) | 13 µs | **14 GB/s** | **128KiB**, `qd_cap=32` | Yes |
 | Host PCIe | — | — | 50 GB/s | spill contention | Trim writes |
+
+`hier_30_50_20.json` still carries `"hbm": {"read_bw_gbps": 2000.0}`. That field is a **placeholder**: `fetch_cost` / `spill_cost` only charge DRAM and SSD. GPU-resident KV and matmul use TransformerRoofline H200 (`TFLOPS=1979`, `BW_TBs=4.8`). The JSON entry does **not** throttle HBM to 2000 GB/s.
+
+出厂 JSON 里的 `hbm.read_bw_gbps=2000` 不参与计时。GPU 侧带宽以 Roofline 的 **4.8 TB/s** 为准。
 
 Decode step:
 
@@ -79,17 +87,36 @@ H200 141 GiB fits weights plus a short KV window, not 100 full contexts. Under P
 
 Stable knee: `output_qps / λ ≥ 0.90` and `ttft_p99 ≤ 3 × ttft_p99(λ=0.02)`. `N* = λ* × request_time.p50`. Scripts share `TokenSim/kv_working_set/knee.py`.
 
-### Case 1 (official) — Poisson knee, all GPU
+`kv_working_set_test_report/ssd_qos_eval/run_eval.py` is the **pipeline**, not an SSD-only job. It runs **Case 1**, **Case 2**, the QoS arms in §9, and writes `fig_qps_knee.png` / `fig_ttft_tpot.png`. The file lives under `ssd_qos_eval/` because that directory owns the shared knee harness. Occupancy (§8) is a separate script.
 
-No working-set config. Result dir `kv_working_set_test_report/all_gpu_poisson`.
+该脚本是 Case 1、Case 2 与 §9 QoS 的总控，并出官方对比图。路径在 `ssd_qos_eval/` 只是评测目录归属，不是“只跑 SSD”。
 
 ```bash
 python3.11 kv_working_set_test_report/ssd_qos_eval/run_eval.py
 ```
 
+To replay one reported knee without the search / 只复现已报膝点、不重新搜 `λ*`：
+
+### Case 1 (official) — Poisson knee, all GPU
+
+No working-set config. Result dir `kv_working_set_test_report/all_gpu_poisson`. Reported `λ* = 0.12`.
+
+```bash
+python3.11 benchmark.py --batching paged-attn --qps 0.12 --distribution poisson \
+  --cluster data/clusters/1_h200/h1.json --model data/psla/llama-70b.json \
+  --verbose none --results_path kv_working_set_test_report/all_gpu_poisson
+```
+
 ### Case 2 (official) — Poisson knee, hierarchical 30/50/20
 
-`--kv_working_set_config data/kv_working_set/hier_30_50_20.json` (128KiB + `layer_prefetch`). Result dir `kv_working_set_test_report/hier_poisson`.
+`--kv_working_set_config data/kv_working_set/hier_30_50_20.json` (128KiB + `layer_prefetch`). Result dir `kv_working_set_test_report/hier_poisson`. Reported `λ* = 0.04`.
+
+```bash
+python3.11 benchmark.py --batching paged-attn --qps 0.04 --distribution poisson \
+  --cluster data/clusters/1_h200/h1.json --model data/psla/llama-70b.json \
+  --verbose none --results_path kv_working_set_test_report/hier_poisson \
+  --kv_working_set_config data/kv_working_set/hier_30_50_20.json
+```
 
 ---
 
@@ -125,7 +152,7 @@ Both arms process **102,452** tokens (51,226 prefill + 51,226 decode).
 | Preemptions | 2 | **0** | — |
 | Σ fetch (unoverlapped) | 0 | 2336 s | stats, not wall |
 | Σ spill | 0 | **1.80 s** | ~18 ms / prompt |
-| SSD IOs (128KiB) | 0 | **1.58e8** | vs 5.05e9 at 4K |
+| SSD IOs (128KiB) | 0 | **1.58e8** | vs 5.05e9 at 4K; count in §7 |
 
 All-GPU fails at 0.14 r/s: output still tracks offered but TTFT p99 jumps to 4.5 s. Hierarchical fails at 0.06 r/s: output QPS plateaus at ~0.043 and TTFT p99 goes to hundreds of seconds. `N*` (6.4) is far below Peak B (25): the SSD/DRAM path saturates before HBM fills.
 
@@ -152,6 +179,18 @@ Per-request generation speed is `1000 / TPOT_ms` (15.8 vs 3.2 tok/s at the knees
 ## 7. Per-step cold-set fetch and overlap / 每步读冷 KV 与重叠
 
 Full attention needs the whole history each decode token. After trim, GPU keeps `gpu_frac`, so `[0, gpu_start)` is read every step. Layer-prefetch hides fetch under 80-layer compute when I/O is small; when the shared SSD queue fills, `T_step ≈ T_fetch`.
+
+Case 2's **1.58e8** SSD IOs (128KiB) is that full cold-set reread, not a once-per-request page-in. Measured `kv_ws_ssd_read_tokens = 7.90e6` and `2.50 MiB / 128 KiB = 20` IOs/token:
+
+```text
+IOs = 100 req × ~512 decode steps × ~154 SSD tokens/step × 20 IOs/token
+    ≈ 1.58e8
+    = 7.90e6 tokens × 20 IOs/token
+```
+
+At 128KiB that is ~20 TB of SSD read for 100 requests. There is no sparsity or GQA shrinkage in this MHA run. The 4K control is ~32× more commands (5.05e9) for the same bytes.
+
+Case 2 的 1.58e8 次 128KiB IO 来自每步全量回读冷 KV，不是每条请求只读一次。无稀疏、无压缩；GQA 会把每 token 字节（因而 IO 次数）缩到约 1/8。
 
 Stats still record unoverlapped fetch (2336 s at the hierarchical knee) so the report can show how much was masked. Wall-clock TPOT is 311 ms, not seconds.
 
@@ -186,6 +225,10 @@ Decode 占用随 `gpu_frac` 变；每个点自己扫 `λ*`。Prefill Peak B 仍�
 | 20% | 39 | 0.02 | 1.02 | 22.1 | 100.0 ms | 0.11 s | 0.41 s | 0 |
 | 15% | 51 | 0.02 | 1.13 | 22.1 | 110.2 ms | 0.11 s | 0.46 s | 0 |
 | 10% | 73 | 0.02 | 1.29 | 22.1 | 129.7 ms | 0.13 s | 0.52 s | 0 |
+
+TPOT p50 is sawtoothed because **each row is taken at that row's own `λ*`**, not at a fixed offered QPS. When `λ*` drops, Little `N*` collapses and SSD queueing disappears, so per-step fetch falls back to light-load. The 25% → 20% step is the clearest: `λ*` 0.04 → 0.02, `N*` **9.01 → 1.02**, TPOT **430.4 → 100.0 ms**. The same effect shows at 70% → 65% (`λ*` 0.08 → 0.06) and 60% → 55% (`λ*` 0.06 → 0.04). Less GPU KV does **not** make a loaded decode step faster; the later rows are simply no longer at the same load.
+
+各行 TPOT 是在各自膝点采集的，不是固定 QPS 对比。`λ*` 下降时并发 `N*` 掉到 ~1，SSD 争用消失，单步 fetch 回到轻载。25%→20% 最明显；不是“留更少显存反而更快”。
 
 Down to ~90% the knee matches all-GPU (`λ*=0.12`, ~128 tok/s): layer-prefetch still hides the small cold set. Below that `λ*` and token/s fall as the cold set grows. `N*` stays below Peak B except that Peak B is an occupancy ceiling, not a measured in-flight count. There is **no TTFT p50 cliff** under Poisson.
 
@@ -223,6 +266,8 @@ Same Poisson-knee recipe, `gpu_frac=0.3`. DRAM coalesced 2 µs / 50 GB/s. SSD 14
 ![Drive ranking at the knee](kv_working_set_test_report/ssd_qos_eval/fig_drive_rank.png)
 
 ![qd_cap sweep knee QPS](kv_working_set_test_report/ssd_qos_eval/fig_qd_cap.png)
+
+Same pipeline as §3 (Case 1 + Case 2 + these QoS arms):
 
 ```bash
 python3.11 kv_working_set_test_report/ssd_qos_eval/run_eval.py

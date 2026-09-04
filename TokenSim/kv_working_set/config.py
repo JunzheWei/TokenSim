@@ -52,6 +52,8 @@ class WorkingSetConfig:
     pcie_bw_gbps: float = DEFAULT_PCIE_BW_GBPS
     dram: MediaReadConfig | None = None
     ssd: MediaReadConfig | None = None
+    # Optional metadata only. Decode/prefill HBM traffic uses TransformerRoofline
+    # (H200 BW_TBs=4.8). fetch_cost / spill_cost never read this field.
     hbm: MediaReadConfig | None = None
 
     def __post_init__(self) -> None:

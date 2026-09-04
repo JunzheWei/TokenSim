@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import fields
 from pathlib import Path
 
 from TokenSim.block.block_manager import BlockManager
+from TokenSim.config.psla_config import LLMResult
 from TokenSim.config.config import ParallelConfig
 from TokenSim.errors import ConfigurationError
 from TokenSim.config.constants import _GB
@@ -28,6 +30,7 @@ from TokenSim.kv_working_set.placement import (
     gpu_resident_tokens,
     split_context,
 )
+from TokenSim.kv_working_set.stats import WorkingSetStats
 from TokenSim.latency import LLMCompassLatencyBackend, RooflineLatencyBackend
 from TokenSim.latency.base import DECODE_SCALE
 from TokenSim.llm.llm_request import Request
@@ -692,6 +695,22 @@ class WorkingSetSpillWriteTest(unittest.TestCase):
         req.decode_len = 1
         cost = spill_cost_for_requests([req], config, SIZE_PER_TOKEN)
         self.assertEqual(cost.latency, 0.0)
+
+    def test_spill_fields_are_on_llmresult_and_stats_dict(self):
+        names = {field.name for field in fields(LLMResult)}
+        for key in (
+            "kv_ws_spill_latency",
+            "kv_ws_dram_write_bytes",
+            "kv_ws_ssd_write_bytes",
+        ):
+            self.assertIn(key, names)
+        cost = spill_cost(100, _hier_config(), SIZE_PER_TOKEN)
+        stats = WorkingSetStats.from_config(_hier_config())
+        stats.record_spill(cost)
+        payload = stats.as_dict()
+        self.assertAlmostEqual(payload["kv_ws_spill_latency"], cost.latency)
+        self.assertEqual(payload["kv_ws_dram_write_bytes"], cost.dram_bytes)
+        self.assertEqual(payload["kv_ws_ssd_write_bytes"], cost.ssd_bytes)
 
 
 if __name__ == "__main__":
