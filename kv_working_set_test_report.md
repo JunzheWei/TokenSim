@@ -4,9 +4,9 @@ Date / 日期: 2026-09-04
 Simulator / 模拟器: TokenSim (roofline backend, Python 3.11)  
 Primary arrival / 主测试到达: `--distribution burst`
 
-This report documents the 70B / H200 comparison of **all-GPU decode** vs **hierarchical KV working-set fetch** (GPU 30% / DRAM 50% / SSD 20%). Burst is the official case so `--qps` does not set inter-arrival time.
+This report documents the 70B / H200 comparison of **all-GPU decode** vs **hierarchical KV working-set fetch** (GPU 30% / DRAM 50% / SSD 20%). Burst is the official case so `--qps` does not set inter-arrival time. Fetch is **page-fault**: the first decode faults the cold tail once; later steps only pay for tokens that newly slide off GPU.
 
-本报告记录 LLaMa2-70B + 1×H200 上 **全 GPU decode** 与 **分层 KV 工作集读取**（GPU 30% / DRAM 50% / SSD 20%）的对照。正式用例使用 **burst**：所有请求在仿真时刻 0 同时到达，`--qps` 不再控制间隔。
+本报告记录 LLaMa2-70B + 1×H200 上 **全 GPU decode** 与 **分层 KV 工作集读取**（GPU 30% / DRAM 50% / SSD 20%）的对照。正式用例使用 **burst**。Fetch 为 **缺页**：第一次 decode 把冷尾读入一次，之后只为新滑出 GPU 的 token 付 I/O。
 
 ---
 
@@ -31,9 +31,9 @@ Working-set media (`data/kv_working_set/hier_30_50_20.json`):
 | DRAM | 0.5 | **2 µs** (PCIe DMA) | **50 GB/s** | Yes |
 | SSD | 0.2 (oldest) | **100 µs** (NVMe) | **7 GB/s** | Yes |
 
-v1 decode step: `T_step = T_roofline + T(dram) + T(ssd)`. Prefill / recompute do **not** add fetch. GPU occupancy is **not** reduced by `gpu_frac`.
+v1 decode step: `T_step = T_roofline + T(dram_miss) + T(ssd_miss)` (page-fault, not a full cold-set read every token). Prefill / recompute do **not** add fetch. GPU occupancy is **not** reduced by `gpu_frac`.
 
-v1 decode：`T_step = T_roofline + T(dram) + T(ssd)`。Prefill / 重算不加 fetch。`gpu_frac` **不减少** GPU KV 占用。
+v1 decode：缺页读取，不是每步把冷 KV 全量再读。Prefill / 重算不加 fetch。`gpu_frac` **不减少** GPU KV 占用。
 
 ---
 
@@ -96,9 +96,9 @@ python3.11 ./benchmark.py --batching paged-attn --qps 10 \
 
 ### Case 2 (official) — burst, hierarchical 30/50/20 / 正式用例：burst 分层
 
-Same arrival and cluster. Adds blocking DRAM/SSD fetch on every decode step.
+Same arrival and cluster. Page-fault DRAM/SSD reads on decode (cold tail once, then window slide).
 
-到达与集群相同。每个 decode 步叠加 DRAM/SSD 阻塞读取。
+到达与集群相同。Decode 缺页读 DRAM/SSD（冷尾一次，之后只跟窗口滑动）。
 
 ```bash
 python3.11 ./benchmark.py --batching paged-attn --qps 10 \
@@ -148,73 +148,80 @@ Both official arms processed **102,452** tokens (51,226 prefill + 51,226 decode)
 
 ---
 
-## 5. Official results (burst) / 正式结果（burst）
+## 5. Official results (burst, page-fault fetch) / 正式结果（burst + 缺页）
 
 | Metric | Case 1 all GPU | Case 2 hierarchical | Ratio (hier / GPU) |
 | --- | --- | --- | --- |
-| TTFT p50 | 141.88 s | 1669.15 s | **11.8×** |
-| TTFT p99 | 316.77 s | 3733.99 s | **11.8×** |
+| TTFT p50 | 141.88 s | 145.01 s | **1.02×** |
+| TTFT p99 | 316.77 s | 323.17 s | **1.02×** |
 | TTFT min | **0.871 s** | **0.871 s** | **1.0×** |
-| TTFT avg | 146.92 s | 1728.13 s | 11.8× |
-| TPOT p50 | **69.0 ms** | **814.9 ms** | **11.8×** |
-| TPOT p99 | 131.3 ms | 1565.6 ms | 11.9× |
-| TPOT avg | 82.0 ms | 965.4 ms | 11.8× |
-| Per-request 1/TPOT p50 | 14.5 tok/s | 1.23 tok/s | 1/11.8 |
-| System token/s | **292.0** | **25.2** | **1/11.6** |
-| Stdout prefill token/s | 146.0 | 12.6 | 1/11.6 |
-| Achieved r/s | 0.285 | 0.025 | 1/11.6 |
-| Simulated duration | 350.91 s | 4068.56 s | 11.6× |
-| Preemptions / recomputes | 73 / 73 | 73 / 73 | same order |
-| Σ `kv_ws_fetch_latency` | 0 | 3717.65 s | decode only |
+| TTFT avg | 146.92 s | 150.03 s | 1.02× |
+| TPOT p50 | **69.0 ms** | **70.6 ms** | **1.02×** |
+| TPOT p99 | 131.3 ms | 133.5 ms | 1.02× |
+| TPOT avg | 82.0 ms | 83.6 ms | 1.02× |
+| Per-request 1/TPOT p50 | 14.48 tok/s | 14.16 tok/s | 1/1.02 |
+| System token/s | **292.0** | **286.5** | **1/1.02** |
+| Stdout prefill token/s | 146.0 | 143.3 | 1/1.02 |
+| Achieved r/s | 0.285 | 0.280 | 1/1.02 |
+| Simulated duration | 350.91 s | 357.59 s | 1.02× |
+| Preemptions / recomputes | 73 / 73 | 73 / 73 | same |
+| Σ `kv_ws_fetch_latency` | 0 | **6.68 s** | first-touch + slide |
 
-Min TTFT is identical: the first packed prefill is the same compute. p50/p99 TTFT grow because the single hybrid worker is busy; hierarchical decode steps include `T_fetch`, so the queue drains ~12× slower. **TPOT is the direct working-set cost.** System token/s falls by the duration ratio because token counts match.
+With page-fault fetch, hierarchical decode is within **~2%** of all-GPU on TTFT, TPOT, and token/s. The remaining gap is the one-time cold-tail fault plus ~1 token/step as the window slides (Σ fetch 6.68 s vs 3718 s when every step re-read the whole cold set).
 
-TTFT min 相同：第一批 packed prefill 计算一样。p50/p99 变大是因为唯一 hybrid worker 被占住；分层 decode 含 `T_fetch`，队列慢约 12 倍。**TPOT 才是工作集的直接代价。** 两边 token 数相同，系统 token/s 随仿真时长同比下降。
+缺页之后，分层与全 GPU 的 TTFT / TPOT / token/s 相差约 **2%**。剩余差距来自第一次把冷尾读入，以及窗口每次滑出约 1 个 token（Σ fetch 6.68 s；以前每步全量读是 3718 s）。
+
+Previous full-read-every-step (for comparison) / 此前每步全量读（对照）:
+
+| Metric | All GPU | Hierarchical (full read) |
+| --- | --- | --- |
+| TPOT p50 | 69.0 ms | 814.9 ms (11.8×) |
+| System token/s | 292 | 25.2 (1/11.6) |
+| Σ fetch | 0 | 3718 s |
 
 ### Comparison figures / 数据对比图
 
-Figures are stored next to this report so they remain in the repo (not only in chat). Data: `kv_working_set_test_report/all_gpu_burst.json`, `hier_burst.json`.
+PNG + JSON live under `kv_working_set_test_report/` (page-fault burst rerun).
 
-对比图与 JSON 保存在报告同目录，不依赖会话里的临时图。
+图和 JSON 在 `kv_working_set_test_report/`（缺页后的 burst 重跑）。
 
 **Figure 1 — slowdown on one axis / 同一纵轴上的变慢倍数**
 
-TTFT (seconds) and TPOT (milliseconds) cannot share a raw y-axis. The ratio *hierarchical / all-GPU* puts both on one plot. All four bars sit near **11.8×**.
+Ratios sit near **1.02×** (was ~11.8× with full-read-every-step).
 
-TTFT（秒）和 TPOT（毫秒）不能画在同一根原始纵轴上。用 *分层 / 全 GPU* 倍数可以把两个指标画在一张图里。四根柱都在 **11.8×** 附近。
+倍数约 **1.02×**（每步全量读时约 11.8×）。
 
 ![Slowdown TTFT p50/p99 and TPOT p50/p99](kv_working_set_test_report/fig_slowdown.png)
 
 **Figure 2 — absolute TTFT and TPOT / 绝对 TTFT 与 TPOT**
 
-Left: TTFT in seconds (queue wait dominates p50/p99). Right: TPOT in milliseconds (direct fetch addend).
+Left: TTFT in seconds (queue wait still dominates p50; the two arms nearly overlap). Right: TPOT in milliseconds (~69 vs ~71 ms).
 
-左：TTFT（秒），p50/p99 主要是排队。右：TPOT（毫秒），工作集读取的直接加项。
+左：TTFT（秒），p50 仍是排队，两臂几乎重合。右：TPOT（毫秒），约 69 vs 71 ms。
 
 ![TTFT seconds and TPOT milliseconds grouped bars](kv_working_set_test_report/fig_ttft_tpot.png)
 
 **Figure 3 — token/s / 吞吐**
 
-Same 102,452 tokens; duration 351 s vs 4069 s. Use **System (prefill+decode)** as cluster throughput. Stdout omits decode tokens. Per-request `1/TPOT p50` is one-stream generation speed (14.5 vs 1.23 tok/s).
+Same 102,452 tokens; duration 351 s vs 358 s. System token/s **292 vs 286.5**.
 
-两边都是 102,452 token；时长 351 s vs 4069 s。集群吞吐看 **System**。终端 stdout 不含 decode token。`1/TPOT p50` 是单请求生成速度（14.5 vs 1.23 tok/s）。
+两边仍是 102,452 token；时长 351 s vs 358 s。系统 token/s **292 vs 286.5**。
 
 ![System, stdout, and per-request token/s](kv_working_set_test_report/fig_tokens.png)
 
-### Optional Case 3 (uniform QPS=10) — sanity check / 可选用例核对
+### Optional Case 3 — historical uniform QPS=10 with full-read fetch / 历史：均匀 QPS=10 + 每步全量读
 
-| Metric | All GPU | Hierarchical |
+Recorded before page-fault. Not comparable to §5.
+
+缺页改动前的数据，不能与 §5 直接比。
+
+| Metric | All GPU | Hierarchical (full read) |
 | --- | --- | --- |
 | Offered QPS | 10 | 10 |
 | Achieved r/s | 0.285 | 0.025 |
 | TTFT p50 | 137.68 s | 1670.89 s |
 | TPOT p50 | 69.0 ms | 816.3 ms |
 | System token/s | 291.9 | 25.2 |
-| Preemptions | 67 | 69 |
-
-Burst vs uniform QPS=10: TPOT and system token/s differ by <1%. Arrival pattern is not the reason hierarchical is slower. `--qps 10` only packs arrivals into the first ~10 s; service takes hundreds to thousands of seconds.
-
-burst 与 uniform QPS=10：TPOT 与系统 token/s 相差不到 1%。分层变慢不是到达模式造成的。`--qps 10` 只是把到达挤在前约 10 秒；服务要几百到几千秒。
 
 ---
 
@@ -224,26 +231,21 @@ Use JSON **`output_token_ps`** for cluster throughput (prefill+decode). The term
 
 集群吞吐看 JSON 的 **`output_token_ps`**。终端 `Thoughput ... token/s` **不含 decode token**（本负载大约少一半）。
 
-Per-request generation speed is `1000 / TPOT_ms` (14.5 vs 1.23 tok/s). That is **not** 292 tok/s: the worker interleaves other requests’ prefills and recomputes.
+Per-request generation speed is `1000 / TPOT_ms` (14.48 vs 14.16 tok/s after page-fault). That is **not** 292 tok/s: the worker interleaves other requests’ prefills and recomputes.
 
-单请求生成速度是 `1000 / TPOT_ms`（14.5 vs 1.23 tok/s）。这不是 292 tok/s：worker 会穿插别人的 prefill 和重算。
+单请求生成速度是 `1000 / TPOT_ms`（缺页后 14.48 vs 14.16 tok/s）。这不是 292 tok/s：worker 会穿插别人的 prefill 和重算。
 
 ---
 
-## 7. Why hierarchical does not beat all-GPU / 为何分层没有快过全 GPU
+## 7. What page-fault changed / 缺页改了什么
 
-v1 **adds I/O without shrinking GPU KV**. Both arms hit the same ~20 GiB KV ceiling and preempt. Hierarchical extra cost is re-reading all DRAM+SSD tokens **every decode step**:
+Full-read-every-step charged `T(dram)+T(ssd)` for the whole cold set on **every** decode token (~12× slower). Page-fault keeps a per-request watermark `kv_ws_fetched_end`: storage is `[0, gpu_start)`; only `[fetched_end, gpu_start)` is I/O.
 
-v1 **只加 I/O、不减 GPU KV**。两臂都撞上约 20 GiB KV 上限并抢占。分层额外代价是 **每个 decode 步把 DRAM+SSD 上的 token 整段再读一遍**：
+每步全量读会对每个 decode token 收取整段冷 KV，大约慢 12 倍。缺页在请求上保留水位 `kv_ws_fetched_end`：存储区是 `[0, gpu_start)`，只对尚未读过的 `[fetched_end, gpu_start)` 计时。
 
-```text
-T_fetch = lat_dram + bytes_dram / 50 GB/s + lat_ssd + bytes_ssd / 7 GB/s
-bytes_*  = floor(S × frac) × 2.50 MiB
-```
+After this change, hierarchical **nearly matches** all-GPU speed (~2%). It still does **not** save HBM: both arms preempt 73 times. Offload’s remaining benefit vs all-GPU would be serving a longer context / higher concurrency than 20 GiB KV allows — that needs `gpu_frac` to cap GPU blocks (not in this run).
 
-A benefit vs all-GPU needs a workload all-GPU **cannot** hold without thrashing, and a model that actually keeps only `gpu_frac` of KV on HBM (not implemented in v1). Burst is the right stress arrival; it does not by itself create an offload win.
-
-要体现 offload 好处，需要全 GPU 会因显存不够而重算的负载，并且模拟器真正只在 HBM 上保留 `gpu_frac` 的 KV（v1 未做）。Burst 适合压测到达，本身不会让 offload 赢。
+改完后分层与全 GPU **几乎追平**（约 2%）。显存占用仍未减少，两臂都抢占 73 次。若要在「全 GPU 放不下」时体现 offload 好处，还需要用 `gpu_frac` 限制 GPU 块数（本次未做）。
 
 ---
 

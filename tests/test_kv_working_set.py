@@ -43,6 +43,7 @@ class _LatencyRequest:
         self.prefill_len = prefill_len
         self.generation_idx = generation_idx
         self.is_prefill = is_prefill
+        self.kv_ws_fetched_end = 0
         self.prefill_compute_len = prefill_len
         self.needs_recompute = needs_recompute
         self.recompute_tokens = recompute_tokens
@@ -156,19 +157,24 @@ class WorkingSetPlacementTest(unittest.TestCase):
         self.assertEqual(cost.ssd_tokens, 0)
         self.assertEqual(cost.latency, 0.0)
 
-    def test_fetch_matches_hand_calculated_media_delay(self):
+    def test_second_decode_only_faults_new_storage_tokens(self):
         config = _hier_config()
-        cost = fetch_cost(100, config, SIZE_PER_TOKEN)
-        expected = media_read_latency(50 * SIZE_PER_TOKEN, config.dram)
-        expected += media_read_latency(20 * SIZE_PER_TOKEN, config.ssd)
-        self.assertAlmostEqual(cost.latency, expected)
-        self.assertAlmostEqual(
-            expected,
-            100.0 / 1e6
-            + (50 * SIZE_PER_TOKEN) / _GB / 50.0
-            + 100.0 / 1e6
-            + (20 * SIZE_PER_TOKEN) / _GB / 7.0,
-        )
+        first = fetch_cost(100, config, SIZE_PER_TOKEN, fetched_end=0)
+        self.assertEqual((first.dram_tokens, first.ssd_tokens), (50, 20))
+        self.assertEqual(first.next_fetched_end, 70)
+        second = fetch_cost(101, config, SIZE_PER_TOKEN, fetched_end=first.next_fetched_end)
+        self.assertEqual(second.ssd_tokens, 0)
+        self.assertEqual(second.dram_tokens, 1)
+        self.assertEqual(second.next_fetched_end, 71)
+        self.assertLess(second.latency, first.latency)
+
+    def test_repeat_fetch_at_same_s_is_zero(self):
+        config = _hier_config()
+        first = fetch_cost(100, config, SIZE_PER_TOKEN)
+        again = fetch_cost(100, config, SIZE_PER_TOKEN, fetched_end=first.next_fetched_end)
+        self.assertEqual(again.latency, 0.0)
+        self.assertEqual(again.dram_tokens, 0)
+        self.assertEqual(again.ssd_tokens, 0)
 
 
 class WorkingSetLatencyBackendTest(unittest.TestCase):
@@ -296,6 +302,39 @@ class WorkingSetLatencyBackendTest(unittest.TestCase):
         observed = backend.estimate_step_latency([request])
         expected_fetch = fetch_cost(100, config, SIZE_PER_TOKEN).latency
         self.assertAlmostEqual(observed, 0.05 + expected_fetch)
+
+    def test_second_backend_step_only_faults_window_slide(self):
+        request = _decode_request(prefill_len=99, generation_idx=1)
+        config = _hier_config()
+        hierarchical = RooflineLatencyBackend(
+            _RooflineStub(),
+            "model",
+            "hardware",
+            ParallelConfig(),
+            working_set_config=config,
+            size_per_token=SIZE_PER_TOKEN,
+        )
+        disabled = RooflineLatencyBackend(
+            _RooflineStub(),
+            "model",
+            "hardware",
+            ParallelConfig(),
+        )
+        hierarchical.estimate_step_latency([request])
+        dram_after_first = hierarchical.kv_ws_stats.kv_ws_dram_read_tokens
+        request.generation_idx = 2
+        baseline = disabled.estimate_step_latency(
+            [_decode_request(prefill_len=99, generation_idx=2)]
+        )
+        observed = hierarchical.estimate_step_latency([request])
+        slide = fetch_cost(101, config, SIZE_PER_TOKEN, fetched_end=70)
+        self.assertEqual(slide.dram_tokens, 1)
+        self.assertEqual(slide.ssd_tokens, 0)
+        self.assertAlmostEqual(observed, baseline + slide.latency)
+        self.assertEqual(
+            hierarchical.kv_ws_stats.kv_ws_dram_read_tokens,
+            dram_after_first + 1,
+        )
 
     def test_decode_scale_is_not_applied_to_fetch(self):
         request = _decode_request(prefill_len=99, generation_idx=1)

@@ -234,6 +234,7 @@ class Request:
     decode_service_time_sum: float = field(default=0.0, repr=False)
     prefill_batch_size: float = field(default=0.0, repr=False)
     decode_batch_sum: float = field(default=0.0, repr=False)
+    kv_ws_fetched_end: int = field(default=0, repr=False)
     tqdm_submit_func = None
 
     def __post_init__(self):

@@ -128,12 +128,19 @@ GPU 比例走现有 roofline，v1 不再单独加 HBM 读取。配置里的 `hbm
 
 ### 3.4 Step latency / 单步时延
 
-v1 uses **blocking** overlap / v1 采用阻塞叠加:
+v1 uses **blocking** overlap and **page-fault fetch** / v1 阻塞叠加 + **缺页读取**:
 
 ```text
-T_fetch = T(dram) + T(ssd)          # 0 if that tier has 0 tokens
+T_fetch = T(dram_miss) + T(ssd_miss)   # only tokens not yet faulted in
 T_step  = T_roofline_decode + T_fetch
 ```
+
+Storage covers ``[0, S_gpu_start)``. The first decode step faults that range
+once; later steps only pay for tokens that newly slide off GPU. Prefill KV is
+not pre-marked resident, so the first decode still page-ins the cold tail.
+
+存储区是 ``[0, S_gpu_start)``。第一次 decode 把这段缺页读入并记下水位；之后只为
+新滑出 GPU 的 token 付 I/O。Prefill 不算已命中，所以第一次 decode 仍会把冷尾读进来。
 
 `T_roofline_decode` is the existing decode-branch result of
 `RooflineLatencyBackend.estimate_step_latency` (after `DECODE_SCALE`).
