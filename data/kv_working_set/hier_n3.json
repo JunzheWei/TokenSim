@@ -1,0 +1,30 @@
+{
+    "enabled": true,
+    "placement": "sliding_window",
+    "gpu_frac": 0.3,
+    "dram_frac": 0.5,
+    "ssd_frac": 0.2,
+    "overlap": "blocking",
+    "dram": {
+        "read_latency_us": 2.0,
+        "read_bw_gbps": 50.0
+    },
+    "ssd": {
+        "read_latency_us": 50.0,
+        "read_bw_gbps": 14.0,
+        "io_size_bytes": 4096,
+        "qd_cap": 32,
+        "qd_latency_us": [
+            [1, 50.0],
+            [32, 50.0],
+            [64, 100.0],
+            [128, 200.0],
+            [256, 400.0],
+            [512, 800.0]
+        ]
+    },
+    "hbm": {
+        "read_latency_us": 0.0,
+        "read_bw_gbps": 2000.0
+    }
+}

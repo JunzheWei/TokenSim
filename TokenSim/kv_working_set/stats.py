@@ -19,6 +19,8 @@ class WorkingSetStats:
     kv_ws_ssd_read_bytes: int = 0
     kv_ws_dram_read_tokens: int = 0
     kv_ws_ssd_read_tokens: int = 0
+    kv_ws_dram_ios: int = 0
+    kv_ws_ssd_ios: int = 0
 
     @classmethod
     def from_config(cls, config: WorkingSetConfig | None) -> "WorkingSetStats":
@@ -38,6 +40,8 @@ class WorkingSetStats:
         self.kv_ws_ssd_read_bytes += cost.ssd_bytes
         self.kv_ws_dram_read_tokens += cost.dram_tokens
         self.kv_ws_ssd_read_tokens += cost.ssd_tokens
+        self.kv_ws_dram_ios += cost.dram_ios
+        self.kv_ws_ssd_ios += cost.ssd_ios
 
     def aggregate(self, other: "WorkingSetStats") -> "WorkingSetStats":
         return WorkingSetStats(
@@ -64,6 +68,8 @@ class WorkingSetStats:
             + other.kv_ws_dram_read_tokens,
             kv_ws_ssd_read_tokens=self.kv_ws_ssd_read_tokens
             + other.kv_ws_ssd_read_tokens,
+            kv_ws_dram_ios=self.kv_ws_dram_ios + other.kv_ws_dram_ios,
+            kv_ws_ssd_ios=self.kv_ws_ssd_ios + other.kv_ws_ssd_ios,
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -78,4 +84,6 @@ class WorkingSetStats:
             "kv_ws_ssd_read_bytes": self.kv_ws_ssd_read_bytes,
             "kv_ws_dram_read_tokens": self.kv_ws_dram_read_tokens,
             "kv_ws_ssd_read_tokens": self.kv_ws_ssd_read_tokens,
+            "kv_ws_dram_ios": self.kv_ws_dram_ios,
+            "kv_ws_ssd_ios": self.kv_ws_ssd_ios,
         }

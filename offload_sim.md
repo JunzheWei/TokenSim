@@ -116,11 +116,29 @@ bytes(tier) = S_tier * size_per_token
 
 ### 3.3 Media delay / 介质时延
 
-Same shape as `OffloadTier` in `TokenSim/mooncake/ssd.py`:
+Coalesced (`io_size_bytes = 0`, default) matches `OffloadTier` in
+`TokenSim/mooncake/ssd.py`:
 
 ```text
 T(tier) = read_latency_us / 1e6 + bytes(tier) / 2^30 / max(eps, read_bw_gbps)
 ```
+
+Queued SSD (`io_size_bytes > 0`) splits the miss into 4K commands and applies a
+host-visible `L(QD)` curve. Default synthesis (no `qd_latency_us` table):
+
+```text
+n_ios = ceil(bytes / io_size_bytes)
+QD    = min(n_ios, qd_cap)
+L     = L1                      if QD <= 32
+      = L1 * (QD / 32)          if QD > 32
+T     = max(n_ios * L / QD, bytes / 2^30 / read_bw_gbps)
+```
+
+`qd_cap` is the one-step outstanding-command cap. Raising it drops `t_iops`
+until `T` hits bandwidth and drives with different `L1` look the same.
+
+`io_size_bytes = 0` 时仍是一次固定延迟 + 传输。`io_size_bytes > 0` 时按 4K
+命令排队；`qd_cap` 决定延迟能否盖过带宽。
 
 GPU / HBM fraction uses the existing roofline (no separate HBM fetch in v1).
 HBM fields in config are optional metadata for phase 2.
@@ -171,10 +189,11 @@ S_ssd  = S - S_gpu - S_dram
 
 `static_fraction` uses the same counts; ranges are unused for `T_fetch`.
 
-**Batch policy (v1):** sum per-request `T_fetch` over the decode batch
-(same spirit as summing attention). Phase 2 may model shared media contention.
+**Batch policy:** coalesced tiers still **sum** per-request `T`. If a tier has
+`io_size_bytes > 0`, that decode step shares one media queue:
+`T = max(Σn_ios × L(QD) / QD, Σbytes / BW)` with `QD = min(Σn_ios, qd_cap)`.
 
-v1 对 batch 内各请求的 `T_fetch` **求和**（与今天 attention 求和一致）。
+合批：`io_size=0` 的层仍按请求求和；`io_size>0` 的层在该 decode 步共享一条队列。
 
 ---
 
@@ -198,8 +217,10 @@ Standalone JSON under `data/kv_working_set/`. Do **not** overload
     "read_bw_gbps": 50.0
   },
   "ssd": {
-    "read_latency_us": 100.0,
-    "read_bw_gbps": 7.0
+    "read_latency_us": 13.0,
+    "read_bw_gbps": 14.0,
+    "io_size_bytes": 4096,
+    "qd_cap": 32
   },
   "hbm": {
     "read_latency_us": 0.0,
@@ -214,13 +235,15 @@ Standalone JSON under `data/kv_working_set/`. Do **not** overload
 | `placement` | yes | `sliding_window` \| `static_fraction` |
 | `gpu_frac` / `dram_frac` / `ssd_frac` | yes | Sum ≈ 1 |
 | `overlap` | yes | v1: `blocking` only; `compute_overlap` reserved / 仅 blocking |
-| `dram` / `ssd` | yes when frac > 0 | `read_latency_us` ≥ 0, `read_bw_gbps` > 0. Example DRAM is PCIe 5.0 x16 host-memory DMA (~2 µs, ~50 GB/s); SSD is NVMe (~100 µs, ~7 GB/s). 示例 DRAM 按 GPU←Host PCIe DMA；SSD 按 NVMe。 |
+| `dram` / `ssd` | yes when frac > 0 | `read_latency_us` ≥ 0, `read_bw_gbps` > 0. Optional: `io_size_bytes` (0 = coalesced), `qd_cap` (≥ 1, default 32), `qd_latency_us` as `[qd, latency_us]` pairs. DRAM example is PCIe DMA (~2 µs, ~50 GB/s, coalesced). Shipped SSD is N3X-SLC 4K@QD1 **13 µs** / **14 GB/s** / 4K / `qd_cap=32`. Also `hier_n3x.json` (18 µs) and `hier_n3.json` (50 µs). |
 | `hbm` | no | Ignored in v1 latency / v1 不计时延 |
 
 Shipped examples / 附带示例:
 
 - `data/kv_working_set/hbm_only.json` — `gpu_frac=1`
-- `data/kv_working_set/hier_30_50_20.json` — hierarchical example
+- `data/kv_working_set/hier_30_50_20.json` — same as `hier_n3x_slc.json` (30/50/20, SLC)
+- `data/kv_working_set/hier_n3x.json` — N3X MLC 18 µs
+- `data/kv_working_set/hier_n3.json` — N3 50 µs
 
 ### 4.2 CLI
 
@@ -266,7 +289,8 @@ recompute unchanged. LLMCompass applies the **same addend** on decode.
 `LLMResult` + `util/results.py`: `kv_ws_enabled`, `kv_ws_placement`,
 `kv_ws_gpu_frac` / `dram_frac` / `ssd_frac`, `kv_ws_fetch_latency`,
 `kv_ws_dram_read_bytes` / `ssd_read_bytes`, `kv_ws_dram_read_tokens` /
-`ssd_read_tokens`. Print one line in `print_all_stats` when enabled.
+`ssd_read_tokens`, `kv_ws_dram_ios` / `ssd_ios`. Print one line in
+`print_all_stats` when enabled.
 
 ### Slice E — Examples / 示例
 
@@ -312,7 +336,10 @@ Reuse `data/clusters/1_h200/h1.json` + `data/psla/llama-70b.json` + `paged-attn`
 | Negative bw / latency | `ConfigurationError` |
 | Split `S=100`, `0.3/0.5/0.2` | counts sum to 100; newest → GPU |
 | `S_dram=S_ssd=0` | `T_fetch == 0` |
-| Hand calc `T_fetch` | matches `lat + bytes/bw` |
+| Hand calc `T_fetch` | `io_size=0` matches `lat + bytes/bw` |
+| 70B token / 4K | 2.50 MiB → 640 IOs |
+| `qd_cap=8` vs `512` | smaller cap → larger `T` on the same miss |
+| SLC/MLC/N3 at `qd_cap=32` | `T(13) < T(18) < T(50)` |
 | `gpu_frac=1` vs disabled | identical decode step latency |
 | Hierarchical vs disabled | decode latency += accumulated `T_fetch` |
 | Prefill / recompute | no fetch addend |
@@ -327,7 +354,7 @@ Reuse `data/clusters/1_h200/h1.json` + `data/psla/llama-70b.json` + `paged-attn`
 - Subtracting off-GPU KV from HBM roofline
 - Write / spill modeling
 - `compute_overlap` (`max(T_roofline, T_fetch)`)
-- Shared PCIe / NVMe queue contention
+- Host vs device write mix (`write_frac` / bandwidth steal)
 - DRAM / SSD **capacity** limits (only GPU HBM blocks are finite)
 
 ---
@@ -336,7 +363,7 @@ Reuse `data/clusters/1_h200/h1.json` + `data/psla/llama-70b.json` + `paged-attn`
 
 1. **Accuracy / 精度:** drop off-GPU tokens from HBM attention bytes.
 2. **Overlap:** `T_step = max(T_roofline, T_fetch)`.
-3. **Writes / 写回:** spill when the window slides off GPU.
+3. **Writes / 写回:** spill when the window slides off GPU; optional write mix.
 4. **Placement:** importance / attention-score residency.
 5. **Traces:** per-step `(tier, tokens, bytes, latency)`.
 6. **Block table:** mark physical blocks with tier.

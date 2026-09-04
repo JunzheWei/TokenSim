@@ -6,8 +6,16 @@ from pathlib import Path
 from TokenSim.block.block_manager import BlockManager
 from TokenSim.config.config import ParallelConfig
 from TokenSim.errors import ConfigurationError
+from TokenSim.config.constants import _GB
 from TokenSim.kv_working_set.config import MediaReadConfig, WorkingSetConfig
-from TokenSim.kv_working_set.fetch import fetch_cost
+from TokenSim.kv_working_set.fetch import (
+    decode_fetch_for_requests,
+    fetch_cost,
+    media_access_latency,
+    media_n_ios,
+    media_queue_latency,
+    media_read_latency,
+)
 from TokenSim.kv_working_set.placement import (
     gpu_resident_blocks,
     gpu_resident_tokens,
@@ -20,7 +28,9 @@ from TokenSim.llm.llm_request import Request
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SIZE_PER_TOKEN = 1024
+SIZE_70B_TOKEN = 64 * 128 * 2 * 2 * 80
 HIER_FRACS = (0.3, 0.5, 0.2)
+SHIPPED_KV_WS = REPO_ROOT / "data" / "kv_working_set"
 
 
 class _RooflineStub:
@@ -145,6 +155,53 @@ class WorkingSetConfigTest(unittest.TestCase):
         self.assertEqual(hier.gpu_frac, 0.3)
         self.assertEqual(hier.dram_frac, 0.5)
         self.assertEqual(hier.ssd_frac, 0.2)
+        self.assertEqual(hier.ssd.read_latency_us, 13.0)
+        self.assertEqual(hier.ssd.read_bw_gbps, 14.0)
+        self.assertEqual(hier.ssd.io_size_bytes, 4096)
+        self.assertEqual(hier.ssd.qd_cap, 32)
+
+    def test_negative_io_size_is_rejected(self):
+        with self.assertRaises(ConfigurationError):
+            WorkingSetConfig(
+                enabled=True,
+                gpu_frac=0.5,
+                dram_frac=0.5,
+                ssd_frac=0.0,
+                dram=MediaReadConfig(
+                    read_latency_us=2.0,
+                    read_bw_gbps=50.0,
+                    io_size_bytes=-1,
+                ),
+            )
+
+    def test_qd_cap_must_be_at_least_one(self):
+        with self.assertRaises(ConfigurationError):
+            WorkingSetConfig(
+                enabled=True,
+                gpu_frac=0.5,
+                dram_frac=0.5,
+                ssd_frac=0.0,
+                dram=MediaReadConfig(
+                    read_latency_us=2.0,
+                    read_bw_gbps=50.0,
+                    qd_cap=0,
+                ),
+            )
+
+    def test_drive_presets_load(self):
+        slc = WorkingSetConfig.from_file(SHIPPED_KV_WS / "hier_n3x_slc.json")
+        mlc = WorkingSetConfig.from_file(SHIPPED_KV_WS / "hier_n3x.json")
+        n3 = WorkingSetConfig.from_file(SHIPPED_KV_WS / "hier_n3.json")
+        shipped = WorkingSetConfig.from_file(SHIPPED_KV_WS / "hier_30_50_20.json")
+        self.assertEqual(slc.ssd.read_latency_us, 13.0)
+        self.assertEqual(mlc.ssd.read_latency_us, 18.0)
+        self.assertEqual(n3.ssd.read_latency_us, 50.0)
+        for cfg in (slc, mlc, n3, shipped):
+            self.assertEqual(cfg.ssd.read_bw_gbps, 14.0)
+            self.assertEqual(cfg.ssd.io_size_bytes, 4096)
+            self.assertEqual(cfg.ssd.qd_cap, 32)
+            self.assertFalse(cfg.dram.queueing_enabled())
+        self.assertEqual(shipped.ssd.read_latency_us, slc.ssd.read_latency_us)
 
 
 class WorkingSetPlacementTest(unittest.TestCase):
@@ -180,6 +237,24 @@ class WorkingSetPlacementTest(unittest.TestCase):
         self.assertEqual(again.latency, 0.0)
         self.assertEqual(again.dram_tokens, 0)
         self.assertEqual(again.ssd_tokens, 0)
+
+    def test_coalesced_io_size_matches_old_formula(self):
+        config = _hier_config()
+        cost = fetch_cost(100, config, SIZE_PER_TOKEN)
+        dram_bytes = 50 * SIZE_PER_TOKEN
+        ssd_bytes = 20 * SIZE_PER_TOKEN
+        expected = (
+            100.0 / 1e6
+            + dram_bytes / _GB / 50.0
+            + 100.0 / 1e6
+            + ssd_bytes / _GB / 7.0
+        )
+        self.assertEqual(config.dram.io_size_bytes, 0)
+        self.assertAlmostEqual(cost.latency, expected)
+        self.assertAlmostEqual(
+            media_access_latency(ssd_bytes, config.ssd),
+            media_read_latency(ssd_bytes, config.ssd),
+        )
 
 
 class WorkingSetLatencyBackendTest(unittest.TestCase):
@@ -356,6 +431,93 @@ class WorkingSetLatencyBackendTest(unittest.TestCase):
         observed = hierarchical.estimate_step_latency([request])
         roofline_decode = observed - fetch
         self.assertAlmostEqual(roofline_decode, 0.011 * DECODE_SCALE)
+
+
+def _queued_ssd(latency_us: float, qd_cap: int = 32) -> MediaReadConfig:
+    return MediaReadConfig(
+        read_latency_us=latency_us,
+        read_bw_gbps=14.0,
+        io_size_bytes=4096,
+        qd_cap=qd_cap,
+    )
+
+
+def _ssd_only_config(ssd: MediaReadConfig) -> WorkingSetConfig:
+    return WorkingSetConfig(
+        enabled=True,
+        placement="sliding_window",
+        gpu_frac=0.0,
+        dram_frac=0.0,
+        ssd_frac=1.0,
+        overlap="blocking",
+        ssd=ssd,
+    )
+
+
+class WorkingSetQueueingTest(unittest.TestCase):
+    def test_70b_token_is_640_ios(self):
+        self.assertEqual(SIZE_70B_TOKEN, 2_621_440)
+        media = _queued_ssd(13.0)
+        self.assertEqual(media_n_ios(SIZE_70B_TOKEN, media), 640)
+
+    def test_qd_cap_eight_slower_than_512(self):
+        bytes_ = SIZE_70B_TOKEN
+        n_ios = 640
+        slow = media_queue_latency(bytes_, n_ios, _queued_ssd(13.0, qd_cap=8))
+        fast = media_queue_latency(bytes_, n_ios, _queued_ssd(13.0, qd_cap=512))
+        self.assertGreater(slow, fast)
+
+    def test_drive_latency_monotonic_at_cap_32(self):
+        bytes_ = 200 * SIZE_70B_TOKEN
+        n_ios = media_n_ios(bytes_, _queued_ssd(13.0))
+        t13 = media_queue_latency(bytes_, n_ios, _queued_ssd(13.0))
+        t18 = media_queue_latency(bytes_, n_ios, _queued_ssd(18.0))
+        t50 = media_queue_latency(bytes_, n_ios, _queued_ssd(50.0))
+        self.assertLess(t13, t18)
+        self.assertLess(t18, t50)
+
+    def test_batch_shares_ssd_queue(self):
+        config = _ssd_only_config(_queued_ssd(13.0, qd_cap=32))
+        reqs = [
+            _LatencyRequest(prefill_len=9, generation_idx=1, is_prefill=False)
+            for _ in range(2)
+        ]
+        cost = decode_fetch_for_requests(reqs, config, 4096)
+        self.assertEqual(cost.ssd_tokens, 20)
+        self.assertEqual(cost.ssd_ios, 20)
+        shared = media_queue_latency(cost.ssd_bytes, cost.ssd_ios, config.ssd)
+        self.assertAlmostEqual(cost.latency, shared)
+        one = fetch_cost(10, config, 4096).latency
+        self.assertAlmostEqual(shared, one)
+        self.assertLess(shared, 2.0 * one - 1e-12)
+
+    def test_queued_prefill_still_skips_fetch(self):
+        request = _LatencyRequest(
+            prefill_len=100,
+            generation_idx=0,
+            is_prefill=True,
+        )
+        config = _ssd_only_config(_queued_ssd(13.0))
+        disabled = RooflineLatencyBackend(
+            _RooflineStub(),
+            "model",
+            "hardware",
+            ParallelConfig(),
+        )
+        hierarchical = RooflineLatencyBackend(
+            _RooflineStub(),
+            "model",
+            "hardware",
+            ParallelConfig(),
+            working_set_config=config,
+            size_per_token=SIZE_70B_TOKEN,
+        )
+        self.assertAlmostEqual(
+            hierarchical.estimate_step_latency([request]),
+            disabled.estimate_step_latency([request]),
+        )
+        self.assertEqual(hierarchical.kv_ws_stats.kv_ws_fetch_latency, 0.0)
+        self.assertEqual(hierarchical.kv_ws_stats.kv_ws_ssd_ios, 0)
 
 
 class WorkingSetGpuOccupancyTest(unittest.TestCase):

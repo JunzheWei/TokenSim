@@ -11,6 +11,22 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 OUT = Path(__file__).resolve().parent
 DRAM_SHARE = 5.0 / 7.0
+DRAM = {"read_latency_us": 2.0, "read_bw_gbps": 50.0}
+SSD = {
+    "read_latency_us": 13.0,
+    "read_bw_gbps": 14.0,
+    "io_size_bytes": 4096,
+    "qd_cap": 32,
+    "qd_latency_us": [
+        [1, 13.0],
+        [32, 13.0],
+        [64, 26.0],
+        [128, 52.0],
+        [256, 104.0],
+        [512, 208.0],
+    ],
+}
+HBM = {"read_latency_us": 0.0, "read_bw_gbps": 2000.0}
 
 
 def split_fracs(gpu_frac: float) -> tuple[float, float, float]:
@@ -39,9 +55,9 @@ def main() -> int:
                     "dram_frac": d,
                     "ssd_frac": s,
                     "overlap": "blocking",
-                    "dram": {"read_latency_us": 2.0, "read_bw_gbps": 50.0},
-                    "ssd": {"read_latency_us": 100.0, "read_bw_gbps": 7.0},
-                    "hbm": {"read_latency_us": 0.0, "read_bw_gbps": 2000.0},
+                    "dram": dict(DRAM),
+                    "ssd": dict(SSD),
+                    "hbm": dict(HBM),
                 },
                 indent=2,
             )
@@ -93,6 +109,7 @@ def main() -> int:
             "kv_ws_fetch_latency": result["kv_ws_fetch_latency"],
             "kv_ws_dram_read_tokens": result["kv_ws_dram_read_tokens"],
             "kv_ws_ssd_read_tokens": result["kv_ws_ssd_read_tokens"],
+            "kv_ws_ssd_ios": result.get("kv_ws_ssd_ios", 0),
         }
         summary.append(row)
         print(
