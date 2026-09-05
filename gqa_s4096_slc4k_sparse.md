@@ -628,7 +628,7 @@ python3.11 gqa_working_set_test_report/s4096_sparse/plot_gpu_frac_sparse.py
 
 **C 相对 A 的结论**：容量本身（reuse=0）要到 1024 token 才追平滑窗，且把 decode 并发墙压到 29；局部性（reuse ≥ 0.5）让 512 就够。没有 trace 前，报告只把 reuse=0 作为主臂。
 
-未做：质量评测（TokenSim 不算 perplexity / 准确率）；Quest 页元数据打分开销；基于真实 trace 的选页分布（方案 B）；页缓存的 `gpu_frac` 扫描；PD 分离与更激进的 KV 下沉见 §7。
+未做：质量评测（TokenSim 不算 perplexity / 准确率）；Quest 页元数据打分开销；基于真实 trace 的选页分布（方案 B）；页缓存的 `gpu_frac` 扫描；PD 分离、更激进的 KV 下沉、加长上下文见 §7。
 
 ### 6.2 结果目录里的历史遗留
 
@@ -638,7 +638,7 @@ python3.11 gqa_working_set_test_report/s4096_sparse/plot_gpu_frac_sparse.py
 
 ## 7. TODO（可行性）
 
-本文是 **1×H200 hybrid**：prefill 和 decode 抢同一块显存。稀疏 decode 的理论并发 53 被 prefill 墙 **32** 先卡住（§0.6、§3.2），再往下减 `gpu_frac` 也换不来系统 token/s（§5）。下面两件事就是冲着这堵墙：分开两块卡、以及 decode 侧再少占 HBM。
+本文是 **1×H200 hybrid**：prefill 和 decode 抢同一块显存。稀疏 decode 的理论并发 53 被 prefill 墙 **32** 先卡住（§0.6、§3.2），再往下减 `gpu_frac` 也换不来系统 token/s（§5）。上下文固定末端 S≈4096。下面三件事：拆卡、decode 再少占 HBM、以及 **S 变长之后 offload 还要不要、要多少**。
 
 ### 7.1 PD 分离（Prefill / Decode 拆卡）
 
@@ -673,3 +673,30 @@ python3.11 gqa_working_set_test_report/s4096_sparse/plot_gpu_frac_sparse.py
 **不要做的。** 在 hybrid 上重复 §5 的 30%→4%、dram=0 网格——结论已经有了。也不要把 StreamingLLM 淘汰（中间 KV 丢掉）混进这条 TODO：本文口径是「存完整 KV，只少算」。
 
 **和 §7.1 的顺序。** 先做 7.1 的 1P+1D，确认 decode 并发能离开 32；再在 decode worker 上跑路径 A/B。否则「更多 KV 下沉」只会改 TPOT（回读变多），改不了可稳定 QPS。
+
+### 7.3 加长上下文：offload 依赖随 S 怎么变
+
+**要做什么。** 本文只跑了末端 **S≈4096**（prefill 2048 + decode 2048）。把 S 拉长，看「必须 offload / 稀疏才能稳」的拐点，以及依赖落在 **容量** 还是 **每步回读**。对照仍用五组，S 取 **4k（本文基线）/ 8k / 16k**，有余力再加 32k。指标：λ\*、Peak B（all_gpu vs 30% 尾部 vs prefill 墙）、每步 SSD token、TPOT、SSD 极限 GiB。
+
+**模拟器已经有的。** 上下文长度是负载 JSON，不是模型架构上限：[`llama-70b-gqa.json`](data/psla/llama-70b-gqa.json) 是 512+512，本文 [`llama-70b-gqa-4k.json`](data/psla/llama-70b-gqa-4k.json) 是 2048+2048。再做 `prefill_mean_len = decode_mean_len = 4096 / 8192 / …` 即可。Roofline、`split_context`、`fetch_cost` 都随 S 变；window=256、k=256、30/0/70 **先保持不动**（固定选中集、比例切分，S 自己长）。
+
+**闭式预期（S=4096 已对过，用来判断扫到哪一档就够）。** 30/0/70、sink=4、window=k=256、H200 4103 块：
+
+| 末端 S | all_gpu Peak B | prefill 墙（prompt=S/2） | 30% 尾部 Peak B | hier 每步 SSD token | select 每步 SSD token | 滑窗每步读盘 |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 4096（本文） | 16 | **32** | 53 | 2868 | 179 | 0（`gpu_frac > 256/S`） |
+| 8192 | 8 | 16 | 26 | 5735 | **179** | 0 |
+| 16384 | 4 | 8 | 13 | 11469 | **179** | 0 |
+| 32768 | 2 | 4 | 6 | 22938 | **179** | 0 |
+
+三件和「依赖程度」直接有关的事：
+
+1. **容量依赖随 S 上升，但 30% 尾部下 SSD 极限几乎不涨。** all_gpu 每请求 KV = `S × 0.3125 MiB`（4k=1.25 GiB，16k=5.0 GiB，32k=10 GiB），Peak B ~1/S。固定 `gpu_frac` 时 decode Peak B 也 ~1/S，SSD 极限 ≈ 46 GiB 封顶（本文 §0.7 已是这个数）。「盘要多大」不是这条 TODO 的主变量；「一张卡还能不能全放 GPU」才是——all_gpu 并发 16→8→4→2。
+2. **全量分层的回读依赖随 S 线性变差。** `hier_full` 每步读 `≈0.7S` token，4k 已经 TPOT 2.55 s、无膝点；8k/16k 只会更差，作对照即可，不必密扫。
+3. **稀疏的回读依赖几乎不随 S 变。** 滑窗只要 `gpu_frac ≥ window/S`（30% 时 S>853 就满足）decode 仍不读盘；选页期望 `k × ssd_frac ≈ 179` token/步，**与 S 无关**。S 越大，稀疏相对全量 GPU / 全量分层的优势越应当来自 **并发（Peak B 比）**，而不是每步更快。
+
+**可行性：高（8k/16k），32k 中。** 只需新 psla + 复用 `run_sweep.py`；不改 working-set 代码。100 条请求墙钟随 decode 长度涨，16k 大约是本文的 4× 仿真时间。32k 时 all_gpu Peak B=2，泊松 100 条容易打满显存抢占，膝点搜索要先把 `request_count` / 到达率网格收紧。
+
+**不要做的。** 不要把 window/k 跟着 S 按比例放大（那就不是「固定工作集、上下文变长」）；若要扫 k∝S 作为附录，另开一行。也不要在 hybrid 上指望 30% 尾部的 Peak B 变成 λ\*——prefill 墙同样按 S/2 下降（32→16→8），仍先卡住，和本文 4k 同一机制。要看「S 变长后 decode 并发」必须叠 §7.1。
+
+**建议读法。** 主图用同一到达率下的系统 token/s 和 TPOT 对 S；旁注 λ\*_sparse / λ\*_all_gpu。该比值随 S 升高，就是 offload+稀疏的依赖在加强；若比值几乎不变，说明 4k 上看到的占用优势没有随上下文放大，offload 的价值主要在「一张卡塞不下」的更长 S（all_gpu Peak B→1）。
