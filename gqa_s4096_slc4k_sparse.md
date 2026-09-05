@@ -628,8 +628,48 @@ python3.11 gqa_working_set_test_report/s4096_sparse/plot_gpu_frac_sparse.py
 
 **C 相对 A 的结论**：容量本身（reuse=0）要到 1024 token 才追平滑窗，且把 decode 并发墙压到 29；局部性（reuse ≥ 0.5）让 512 就够。没有 trace 前，报告只把 reuse=0 作为主臂。
 
-未做：质量评测（TokenSim 不算 perplexity / 准确率）；Quest 页元数据打分开销；基于真实 trace 的选页分布（方案 B）；页缓存的 `gpu_frac` 扫描。
+未做：质量评测（TokenSim 不算 perplexity / 准确率）；Quest 页元数据打分开销；基于真实 trace 的选页分布（方案 B）；页缓存的 `gpu_frac` 扫描；PD 分离与更激进的 KV 下沉见 §7。
 
 ### 6.2 结果目录里的历史遗留
 
 `gqa_working_set_test_report/s4096_sparse/` 下的 `hier_sparse256/`、`streaming_sparse/`，以及 `data/kv_working_set/hier_30_50_20_*.json`，来自更早的实验设计（30/50/20 分层、StreamingLLM 淘汰），本文不引用。
+
+---
+
+## 7. TODO（可行性）
+
+本文是 **1×H200 hybrid**：prefill 和 decode 抢同一块显存。稀疏 decode 的理论并发 53 被 prefill 墙 **32** 先卡住（§0.6、§3.2），再往下减 `gpu_frac` 也换不来系统 token/s（§5）。下面两件事就是冲着这堵墙：分开两块卡、以及 decode 侧再少占 HBM。
+
+### 7.1 PD 分离（Prefill / Decode 拆卡）
+
+**要做什么。** 不再用 hybrid。Prefill worker 只做首 token、写出全部 KV；decode worker 只做逐 token，KV 经连接器搬过去。对照仍用本文五组（`all_gpu_full` / `hier_full` / `sparse_offload` / `select_offload` / `cache_offload`），看膝点 λ\*、系统 token/s、TPOT、TTFT（TTFT 会多一段 P→D 传输）。
+
+**模拟器已经有的。** 角色 `prefill` / `decode`、`LLMEngine.dispatch_prefill_to_decode`、容量校验已经按角色拆开（prefill 按满上下文占块，decode 按 `gpu_frac` + sink/cache）。现成例子：[`data/clusters/8_a100/p2d5.json`](data/clusters/8_a100/p2d5.json)（2P+6D，A100）。连接器用 `P2PConnector` 或 `MooncakeConnector`（见 [`docs/parallelism.md`](docs/parallelism.md)、[`docs/mooncake.md`](docs/mooncake.md)）。
+
+**还缺的。**
+
+- 没有 H200 的 PD 集群 JSON。最小配方是 **1P+1D H200**（和本文 1 卡 hybrid 比「拆开之后 decode 还能不能吃到 Peak B 53」）；下一档 1P+N D 才谈 decode 扩容。
+- 本文从未把 `kv_working_set` 和 PD 一起跑。传输按块搬完后，decode 侧要不要立刻 trim + spill 到 DRAM/SSD，需要先写一条集成测试，确认不会重复占块、不会漏计 spill。
+- P→D 传输量：prefill 结束时约 **2048 × 0.3125 MiB ≈ 640 MiB / 请求**。PCIe 50 GiB/s 约 12 ms，100Gb 以太约 50 ms，进 TTFT，不进 TPOT。稀疏不减小这笔（中间 KV 仍要留下）。
+
+**可行性：高。** 调度和传输路径现成，工作量主要是 H200 集群文件 + 与 working-set 的联跑回归 + 膝点扫描。不改 attention 模型。
+
+**和本文结论的关系。** 若 PD 后 `sparse_offload` 的 λ\* 明显超过 0.14，就能坐实「hybrid 上那 0.14 是 prefill 墙，不是 SSD」。`hier_full` 即使拆卡，decode 每步仍读 70% 冷集，预期仍然不稳。
+
+### 7.2 再降显存占用：更多 KV 下到 DRAM / SSD
+
+**要做什么。** decode 侧 GPU 只留选中集（或更短的尾部），其余进 DRAM 或 SSD，看 TPOT 和系统 token/s 随 HBM 占用怎么变。指标仍是 1/TPOT（单请求速度）和膝点 token/s（系统速度），并报每请求 GPU/DRAM/SSD MiB。
+
+**本文已经排除的。** §5 在 **hybrid + dram_frac=0** 下把 `gpu_frac` 从 30% 降到 4%：滑窗几乎不掉速（window 还在 GPU 里），选页掉 27%（每步多读盘）；系统 token/s 几乎不动，因为 prefill 墙仍是 32。所以 **只在 hybrid 上继续降 `gpu_frac` 研究不了「省显存换并发」**，必须和 §7.1 一起做，或至少让 decode 不再和 prefill 抢块。
+
+**三条可跑的路径（都不需要新的选页模型）。**
+
+| 路径 | 做法 | 可行性 | 预期 |
+| --- | --- | --- | --- |
+| A. 把 DRAM 加回来 | 固定较小 `gpu_frac`（如 0.06 ≈ window/S），扫 `dram_frac` / `ssd_frac`（例如 6/94/0、6/50/44、6/0/94） | **高**：配置字段现成，§5 脚本加一维即可 | 选页冷读从 SSD 14 GiB/s 改走 DRAM ~50 GiB/s、~2 µs；滑窗在 `gpu_frac ≥ window/S` 时仍不读冷集 |
+| B. GPU 只留 sink+window | `gpu_frac ≈ 260/4096 ≈ 6.3%`（或新 placement：驻留 = attended set，不留 30% 尾部里那 972 个白占的 token，§0.5） | **中**：比例扫描已有；「驻留=选中集」要改 `gpu_resident_tokens`，Peak B 从 53 升到约 `floor(4103/17)≈241` | 必须 PD 或 decode 专用卡，否则 hybrid 上 Peak B 再高也被 prefill 32 卡住 |
+| C. 选页 + 页缓存的 `gpu_frac` 扫描 | 第 5 节没扫 `cache_offload`；缓存 512 在更小尾部上占比更大 | **高**：`select_cache_tokens` 已计入占块 | 尾部变短后命中率公式仍是 `C/冷集`，冷集变大，reuse=0 时命中更差 |
+
+**不要做的。** 在 hybrid 上重复 §5 的 30%→4%、dram=0 网格——结论已经有了。也不要把 StreamingLLM 淘汰（中间 KV 丢掉）混进这条 TODO：本文口径是「存完整 KV，只少算」。
+
+**和 §7.1 的顺序。** 先做 7.1 的 1P+1D，确认 decode 并发能离开 32；再在 decode worker 上跑路径 A/B。否则「更多 KV 下沉」只会改 TPOT（回读变多），改不了可稳定 QPS。
