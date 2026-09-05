@@ -1,0 +1,21 @@
+{
+    "name": "llama70b-gqa-4k",
+    "model": "LLaMa2-70B-GQA",
+    "qps": 1000,
+    "distribution": "uniform",
+    "prefill_mean_len": 2048,
+    "prefill_range_len": 32,
+    "decode_mean_len": 2048,
+    "decode_range_len": 32,
+    "decode_len_distribution": "uniform",
+    "first_token_latency": {
+        "max": 10,
+        "p50": 2,
+        "p99": 3
+    },
+    "decode_token_latency": {
+        "p50": 0.02,
+        "p99": 0.05,
+        "max": 1
+    }
+}

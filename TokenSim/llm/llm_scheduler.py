@@ -162,6 +162,9 @@ class LLMPagedAttnScheduler(LLMScheduler):
         max_occupy_ratio: float = 1,
         connector=None,
         gpu_frac: float = 1.0,
+        sink_tokens: int = 0,
+        window_tokens: int = 0,
+        streaming_attention: bool = False,
     ):
         super().__init__(connector=connector)
 
@@ -175,6 +178,9 @@ class LLMPagedAttnScheduler(LLMScheduler):
             num_cpu_blocks=self.cache_config.num_cpu_blocks,
             model=self.cache_config.model,
             gpu_frac=gpu_frac,
+            sink_tokens=sink_tokens,
+            window_tokens=window_tokens,
+            streaming_attention=streaming_attention,
         )
 
         self.max_occupy_ratio = max_occupy_ratio

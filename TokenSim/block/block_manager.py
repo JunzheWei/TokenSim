@@ -4,8 +4,35 @@ from TokenSim.block.block_pool import BlockPool
 from TokenSim.block.block_table import BlockTable
 from TokenSim.block.kv_cache_manager import KVCacheManager, PrefixReusePlan
 from TokenSim.errors import OutOfBlocksError, SimulationStateError
-from TokenSim.kv_working_set.placement import gpu_resident_blocks
+from TokenSim.kv_working_set.placement import gpu_resident_blocks, retained_tokens
 from typing import Tuple
+
+
+def _streaming_keep_blocks(
+    blocks: list[PhysicalTokenBlock],
+    context_len: int,
+    block_size: int,
+    sink_tokens: int,
+    window_tokens: int,
+) -> list[PhysicalTokenBlock]:
+    """Keep sink prefix blocks and newest window blocks; drop the middle."""
+    if not blocks or block_size <= 0:
+        return []
+    kept = retained_tokens(context_len, sink_tokens, window_tokens)
+    if kept <= 0:
+        return []
+    if kept >= context_len:
+        return list(blocks)
+    sink = min(max(0, int(sink_tokens)), context_len)
+    window = kept - sink
+    sink_blocks = (sink + block_size - 1) // block_size if sink else 0
+    window_blocks = (window + block_size - 1) // block_size if window else 0
+    n = len(blocks)
+    if sink_blocks + window_blocks >= n:
+        return list(blocks)
+    keep_idx = set(range(min(sink_blocks, n)))
+    keep_idx.update(range(max(0, n - window_blocks), n))
+    return [blocks[i] for i in sorted(keep_idx)]
 
 
 class BlockAllocator:
@@ -102,11 +129,17 @@ class BlockManager:
         model: str = "unknown",
         watermark: float = 0.01,
         gpu_frac: float = 1.0,
+        sink_tokens: int = 0,
+        window_tokens: int = 0,
+        streaming_attention: bool = False,
     ):
         self.block_size = block_size
         self.num_total_gpu_blocks = num_gpu_blocks
         self.num_total_cpu_blocks = num_cpu_blocks
         self.gpu_frac = gpu_frac
+        self.sink_tokens = max(0, int(sink_tokens))
+        self.window_tokens = max(0, int(window_tokens))
+        self.streaming_attention = bool(streaming_attention)
 
         self.block_table = BlockTable()
         self.kv_cache_manager = KVCacheManager(block_size=block_size, model=model)
@@ -122,7 +155,7 @@ class BlockManager:
         self._reserved_gpu_blocks: list[PhysicalTokenBlock] = []
 
     def _constrain_gpu_occupancy(self) -> bool:
-        return self.gpu_frac < 1.0
+        return self.gpu_frac < 1.0 or self.streaming_attention
 
     def _occupancy_frac(self, req: Request) -> float:
         """Prefill/recompute keep the full context on HBM; decode uses gpu_frac."""
@@ -131,8 +164,21 @@ class BlockManager:
         return self.gpu_frac
 
     def _gpu_target_blocks(self, req: Request) -> int:
+        if self.streaming_attention and not (
+            req.is_prefill or getattr(req, "needs_recompute", False)
+        ):
+            tokens = retained_tokens(
+                req.context_len, self.sink_tokens, self.window_tokens
+            )
+            if tokens <= 0 or self.block_size <= 0:
+                return 0
+            return (tokens + self.block_size - 1) // self.block_size
+        sink = 0 if self._occupancy_frac(req) >= 1.0 else self.sink_tokens
         return gpu_resident_blocks(
-            req.context_len, self.block_size, self._occupancy_frac(req)
+            req.context_len,
+            self.block_size,
+            self._occupancy_frac(req),
+            sink,
         )
 
     def can_allocate(self, req: Request) -> bool:
@@ -203,7 +249,7 @@ class BlockManager:
         return req.num_logical_token_blocks
 
     def trim_to_gpu_target(self, req: Request) -> int:
-        """Free oldest GPU blocks down to decode ``gpu_frac``. Spill I/O is not charged."""
+        """Free GPU blocks down to decode residency. Spill I/O is not charged."""
         if not self._constrain_gpu_occupancy():
             return 0
         if req.is_prefill or getattr(req, "needs_recompute", False):
@@ -212,8 +258,18 @@ class BlockManager:
         blocks = self.block_table.get_blocks(req.id)
         if len(blocks) <= target:
             return 0
-        spill = blocks[: len(blocks) - target]
-        keep = blocks[len(blocks) - target :]
+        if self.streaming_attention:
+            keep = _streaming_keep_blocks(
+                blocks,
+                req.context_len,
+                self.block_size,
+                self.sink_tokens,
+                self.window_tokens,
+            )
+            spill = [block for block in blocks if block not in set(keep)]
+        else:
+            spill = blocks[: len(blocks) - target]
+            keep = blocks[len(blocks) - target :]
         for block in spill:
             self._free_block(block)
         self.block_table.set_blocks(req.id, keep)

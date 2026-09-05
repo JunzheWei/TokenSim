@@ -1,0 +1,11 @@
+{
+    "enabled": true,
+    "placement": "sliding_window",
+    "gpu_frac": 1.0,
+    "dram_frac": 0.0,
+    "ssd_frac": 0.0,
+    "overlap": "blocking",
+    "streaming_attention": true,
+    "sink_tokens": 4,
+    "window_tokens": 256
+}

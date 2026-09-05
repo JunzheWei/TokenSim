@@ -12,8 +12,10 @@ from TokenSim.kv_working_set.fetch import (
 )
 from TokenSim.kv_working_set.placement import (
     ContextSplit,
+    attention_tokens,
     gpu_resident_blocks,
     gpu_resident_tokens,
+    retained_tokens,
     split_context,
 )
 from TokenSim.kv_working_set.stats import WorkingSetStats
@@ -25,6 +27,7 @@ __all__ = [
     "MediaReadConfig",
     "WorkingSetConfig",
     "WorkingSetStats",
+    "attention_tokens",
     "decode_fetch_for_requests",
     "fetch_cost",
     "layer_prefetch_step_latency",
@@ -34,6 +37,7 @@ __all__ = [
     "media_read_latency",
     "gpu_resident_blocks",
     "gpu_resident_tokens",
+    "retained_tokens",
     "spill_cost",
     "spill_cost_for_requests",
     "split_context",

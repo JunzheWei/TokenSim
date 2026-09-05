@@ -7,7 +7,7 @@ from pathlib import Path
 
 from TokenSim.config.cache_config import CacheConfig
 from TokenSim.kv_working_set.knee import little_concurrency, search_knee_qps
-from TokenSim.kv_working_set.placement import gpu_resident_blocks
+from TokenSim.kv_working_set.placement import gpu_resident_blocks, retained_tokens
 from TransformerRoofline import TransformerRoofline
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,8 +55,18 @@ def peak_b(
     block_size: int = 16,
     *,
     gpu_blocks: int | None = None,
+    sink_tokens: int = 0,
+    window_tokens: int = 0,
+    streaming_attention: bool = False,
 ) -> int:
-    blocks = gpu_resident_blocks(context, block_size, gpu_frac)
+    blocks = gpu_resident_blocks(
+        context,
+        block_size,
+        gpu_frac,
+        sink_tokens,
+        window_tokens,
+        streaming_attention,
+    )
     if blocks <= 0:
         return 0
     return available_gpu_blocks(gpu_blocks) // blocks
@@ -161,6 +171,7 @@ def find_config_knee(
     *,
     model: Path | None = None,
     gpu_blocks: int | None = None,
+    context: int = 1024,
 ) -> dict:
     print(f"=== knee {tag} ===", flush=True)
 
@@ -172,13 +183,46 @@ def find_config_knee(
     qps_star, points = search_knee_qps(evaluate)
     knee = dict(points[qps_star])
     gpu_frac = float(extra.get("gpu_frac", 1.0 if config_path is None else 0.3))
+    sink_tokens = 0
+    window_tokens = 0
+    streaming = bool(extra.get("streaming_attention"))
+    if extra.get("sparse") or streaming:
+        sink_tokens = int(extra.get("sink_tokens", 0))
+    if streaming:
+        window_tokens = int(extra.get("window_tokens", 0))
+        kept = retained_tokens(context, sink_tokens, window_tokens)
+        attn_kept = kept
+    elif extra.get("sparse"):
+        attn_kept = retained_tokens(
+            context,
+            int(extra.get("sink_tokens", 0)),
+            int(extra.get("window_tokens", 0)),
+        )
+        kept = context
+    else:
+        attn_kept = context
+        kept = context
     row = {
         "tag": tag,
         **extra,
         **knee,
         "qps_star": qps_star,
         "n_star": knee["little_n"],
-        "peak_b": peak_b(gpu_frac, gpu_blocks=gpu_blocks),
+        "retained_kv_tokens": kept,
+        "attention_kv_tokens": attn_kept,
+        "peak_b": peak_b(
+            gpu_frac,
+            context=context,
+            gpu_blocks=gpu_blocks,
+            sink_tokens=sink_tokens,
+            window_tokens=window_tokens,
+            streaming_attention=streaming,
+        ),
+        "peak_b_prefill": peak_b(
+            1.0,
+            context=2048,
+            gpu_blocks=gpu_blocks,
+        ),
         "curve": [
             {**points[q], "offered_qps": q, "stable": q <= qps_star + 1e-12}
             for q in sorted(points)

@@ -249,8 +249,16 @@ class LLMWorker(Worker):
         )
 
         ws_gpu_frac = 1.0
+        ws_sink = 0
+        ws_window = 0
+        ws_streaming = False
         if working_set_config is not None and working_set_config.enabled:
             ws_gpu_frac = working_set_config.gpu_frac
+            if working_set_config.sparse or working_set_config.streaming_attention:
+                ws_sink = working_set_config.sink_tokens
+            if working_set_config.streaming_attention:
+                ws_window = working_set_config.window_tokens
+                ws_streaming = True
 
         if batching == "paged-attn":
             self.scheduler = LLMPagedAttnScheduler(
@@ -260,6 +268,9 @@ class LLMWorker(Worker):
                 max_occupy_ratio=max_occupy_ratio if self.role != "prefill" else 1,
                 connector=self.connector,
                 gpu_frac=ws_gpu_frac,
+                sink_tokens=ws_sink,
+                window_tokens=ws_window,
+                streaming_attention=ws_streaming,
             )
         elif batching == "static":
             self.scheduler = LLMStaticScheduler(
@@ -533,9 +544,17 @@ class LLMEngine(Worker):
 
     def validate_request_capacity(self, requests: list[Request]) -> None:
         gpu_frac = 1.0
+        sink_tokens = 0
+        window_tokens = 0
+        streaming_attention = False
         working_set_config = getattr(self, "working_set_config", None)
         if working_set_config is not None and working_set_config.enabled:
             gpu_frac = working_set_config.gpu_frac
+            if working_set_config.sparse or working_set_config.streaming_attention:
+                sink_tokens = working_set_config.sink_tokens
+            if working_set_config.streaming_attention:
+                window_tokens = working_set_config.window_tokens
+                streaming_attention = True
         role_pools = (
             (
                 "prefill",
@@ -548,7 +567,12 @@ class LLMEngine(Worker):
                 "decode",
                 self.decode_workers.workers,
                 lambda req: gpu_resident_blocks(
-                    req.prefill_len + req.decode_len, req.block_size, gpu_frac
+                    req.prefill_len + req.decode_len,
+                    req.block_size,
+                    gpu_frac,
+                    sink_tokens,
+                    window_tokens,
+                    streaming_attention,
                 ),
             ),
         )

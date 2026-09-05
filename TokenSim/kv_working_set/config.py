@@ -55,6 +55,12 @@ class WorkingSetConfig:
     # Optional metadata only. Decode/prefill HBM traffic uses TransformerRoofline
     # (H200 BW_TBs=4.8). fetch_cost / spill_cost never read this field.
     hbm: MediaReadConfig | None = None
+    # Keep full KV on the hierarchy; decode attends to sink ∪ window only.
+    sparse: bool = False
+    # Evict the middle; GPU holds only sink ∪ window (no DRAM/SSD).
+    streaming_attention: bool = False
+    sink_tokens: int = 4
+    window_tokens: int = 256
 
     def __post_init__(self) -> None:
         if self.placement not in SUPPORTED_PLACEMENTS:
@@ -87,6 +93,14 @@ class WorkingSetConfig:
         self._require_media("ssd", self.ssd_frac, self.ssd)
         if self.hbm is not None:
             _validate_media("hbm", self.hbm)
+        if self.sink_tokens < 0:
+            raise ConfigurationError(
+                f"sink_tokens must be >= 0, got {self.sink_tokens}"
+            )
+        if self.window_tokens < 0:
+            raise ConfigurationError(
+                f"window_tokens must be >= 0, got {self.window_tokens}"
+            )
 
     def any_queueing(self) -> bool:
         return any(
@@ -134,6 +148,10 @@ class WorkingSetConfig:
             dram=_parse_media(payload.get("dram")),
             ssd=_parse_media(payload.get("ssd")),
             hbm=_parse_media(payload.get("hbm")),
+            sparse=bool(payload.get("sparse", False)),
+            streaming_attention=bool(payload.get("streaming_attention", False)),
+            sink_tokens=int(payload.get("sink_tokens", 4)),
+            window_tokens=int(payload.get("window_tokens", 256)),
         )
 
 

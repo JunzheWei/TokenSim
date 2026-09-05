@@ -23,12 +23,15 @@ from TokenSim.kv_working_set.fetch import (
     media_n_ios,
     media_queue_latency,
     media_read_latency,
+    qd_latency_us,
     spill_cost,
     spill_cost_for_requests,
 )
 from TokenSim.kv_working_set.placement import (
+    attention_tokens,
     gpu_resident_blocks,
     gpu_resident_tokens,
+    retained_tokens,
     split_context,
 )
 from TokenSim.kv_working_set.stats import WorkingSetStats
@@ -201,6 +204,12 @@ class WorkingSetConfigTest(unittest.TestCase):
                 ),
             )
 
+    def test_negative_sink_or_window_is_rejected(self):
+        with self.assertRaises(ConfigurationError):
+            WorkingSetConfig(enabled=True, gpu_frac=1.0, sink_tokens=-1)
+        with self.assertRaises(ConfigurationError):
+            WorkingSetConfig(enabled=True, gpu_frac=1.0, window_tokens=-1)
+
     def test_qd_cap_must_be_at_least_one(self):
         with self.assertRaises(ConfigurationError):
             WorkingSetConfig(
@@ -230,6 +239,31 @@ class WorkingSetConfigTest(unittest.TestCase):
             self.assertEqual(cfg.overlap, "layer_prefetch")
             self.assertFalse(cfg.dram.queueing_enabled())
         self.assertEqual(shipped.ssd.read_latency_us, slc.ssd.read_latency_us)
+
+    def test_shipped_4k_files_load(self):
+        full = WorkingSetConfig.from_file(SHIPPED_KV_WS / "hier_30_50_20_slc_4k.json")
+        sparse = WorkingSetConfig.from_file(
+            SHIPPED_KV_WS / "hier_30_50_20_slc_4k_sparse256.json"
+        )
+        self.assertFalse(full.sparse)
+        self.assertEqual(full.ssd.io_size_bytes, 4096)
+        self.assertEqual(full.ssd.qd_cap, 64)
+        self.assertEqual(full.ssd.qd_latency_us, ())
+        self.assertTrue(sparse.sparse)
+        self.assertEqual(sparse.sink_tokens, 4)
+        self.assertEqual(sparse.window_tokens, 256)
+        self.assertEqual(sparse.ssd.io_size_bytes, 4096)
+        self.assertEqual(sparse.ssd.qd_cap, 64)
+        streaming = WorkingSetConfig.from_file(
+            SHIPPED_KV_WS / "streaming_sink4_window256.json"
+        )
+        self.assertTrue(streaming.streaming_attention)
+        self.assertFalse(streaming.sparse)
+        self.assertEqual(streaming.gpu_frac, 1.0)
+        self.assertEqual(streaming.dram_frac, 0.0)
+        self.assertEqual(streaming.ssd_frac, 0.0)
+        self.assertEqual(streaming.sink_tokens, 4)
+        self.assertEqual(streaming.window_tokens, 256)
 
 
 class WorkingSetPlacementTest(unittest.TestCase):
@@ -549,6 +583,54 @@ class WorkingSetQueueingTest(unittest.TestCase):
         fast = media_queue_latency(bytes_, n_ios, _queued_ssd(13.0, qd_cap=512))
         self.assertGreater(slow, fast)
 
+    def test_qd_cap_eight_slower_than_64(self):
+        bytes_ = SIZE_70B_TOKEN
+        n_ios = 640
+        slow = media_queue_latency(bytes_, n_ios, _queued_ssd(13.0, qd_cap=8))
+        fast = media_queue_latency(bytes_, n_ios, _queued_ssd(13.0, qd_cap=64))
+        self.assertGreater(slow, fast)
+
+    def test_no_table_qd64_13us_hits_bw_not_2p46m_iops(self):
+        media = _queued_ssd(13.0, qd_cap=64)
+        self.assertAlmostEqual(qd_latency_us(media, 64), 13.0)
+        bytes_ = 820 * 327_680
+        n_ios = media_n_ios(bytes_, media)
+        self.assertEqual(n_ios, 65600)
+        t = media_queue_latency(bytes_, n_ios, media)
+        t_bw = bytes_ / _GB / 14.0
+        t_iops_flat = n_ios * 13e-6 / 64
+        t_iops_inflated = n_ios * 26e-6 / 64
+        self.assertAlmostEqual(t, max(t_iops_flat, t_bw))
+        self.assertAlmostEqual(t, t_bw)
+        iops = n_ios / t
+        self.assertGreater(iops, 3.0e6)
+        self.assertLess(t, t_iops_inflated)
+
+    def test_no_table_qd64_50us_is_slower_than_13us(self):
+        bytes_ = 820 * 327_680
+        n_ios = media_n_ios(bytes_, _queued_ssd(13.0, qd_cap=64))
+        t13 = media_queue_latency(bytes_, n_ios, _queued_ssd(13.0, qd_cap=64))
+        t50 = media_queue_latency(bytes_, n_ios, _queued_ssd(50.0, qd_cap=64))
+        self.assertGreater(t50, t13)
+        self.assertAlmostEqual(t50, n_ios * 50e-6 / 64)
+
+    def test_qd_latency_table_still_interpolates(self):
+        media = MediaReadConfig(
+            read_latency_us=13.0,
+            read_bw_gbps=14.0,
+            io_size_bytes=4096,
+            qd_cap=64,
+            qd_latency_us=((1.0, 13.0), (32.0, 13.0), (64.0, 26.0)),
+        )
+        self.assertAlmostEqual(qd_latency_us(media, 32), 13.0)
+        self.assertAlmostEqual(qd_latency_us(media, 64), 26.0)
+        bytes_ = 820 * 327_680
+        n_ios = media_n_ios(bytes_, media)
+        t = media_queue_latency(bytes_, n_ios, media)
+        t_iops = n_ios * 26e-6 / 64
+        t_bw = bytes_ / _GB / 14.0
+        self.assertAlmostEqual(t, max(t_iops, t_bw))
+
     def test_drive_latency_monotonic_at_cap_32(self):
         bytes_ = 200 * SIZE_70B_TOKEN
         n_ios = media_n_ios(bytes_, _queued_ssd(13.0))
@@ -713,6 +795,323 @@ class WorkingSetSpillWriteTest(unittest.TestCase):
         self.assertAlmostEqual(payload["kv_ws_spill_latency"], cost.latency)
         self.assertEqual(payload["kv_ws_dram_write_bytes"], cost.dram_bytes)
         self.assertEqual(payload["kv_ws_ssd_write_bytes"], cost.ssd_bytes)
+
+
+def _sparse_config(
+    gpu_frac: float = HIER_FRACS[0],
+    dram_frac: float = HIER_FRACS[1],
+    ssd_frac: float = HIER_FRACS[2],
+    sink_tokens: int = 4,
+    window_tokens: int = 256,
+) -> WorkingSetConfig:
+    return WorkingSetConfig(
+        enabled=True,
+        placement="sliding_window",
+        gpu_frac=gpu_frac,
+        dram_frac=dram_frac,
+        ssd_frac=ssd_frac,
+        overlap="blocking",
+        sparse=True,
+        sink_tokens=sink_tokens,
+        window_tokens=window_tokens,
+        dram=MediaReadConfig(read_latency_us=2.0, read_bw_gbps=50.0),
+        ssd=MediaReadConfig(read_latency_us=13.0, read_bw_gbps=14.0),
+    )
+
+
+class WorkingSetSparseFetchTest(unittest.TestCase):
+    def test_sparse_false_matches_full_split_and_fetch(self):
+        full = _hier_config()
+        tagged = WorkingSetConfig(
+            enabled=True,
+            placement="sliding_window",
+            gpu_frac=HIER_FRACS[0],
+            dram_frac=HIER_FRACS[1],
+            ssd_frac=HIER_FRACS[2],
+            overlap="blocking",
+            sparse=False,
+            sink_tokens=4,
+            window_tokens=256,
+            dram=MediaReadConfig(read_latency_us=100.0, read_bw_gbps=50.0),
+            ssd=MediaReadConfig(read_latency_us=100.0, read_bw_gbps=7.0),
+        )
+        for s in (2048, 4096):
+            self.assertEqual(split_context(s, tagged), split_context(s, full))
+            a = fetch_cost(s, tagged, SIZE_PER_TOKEN)
+            b = fetch_cost(s, full, SIZE_PER_TOKEN)
+            self.assertEqual((a.dram_tokens, a.ssd_tokens), (b.dram_tokens, b.ssd_tokens))
+            self.assertAlmostEqual(a.latency, b.latency)
+
+    def test_s4096_full_vs_sparse_split_and_io(self):
+        full = split_context(4096, _hier_config())
+        self.assertEqual((full.gpu, full.dram, full.ssd), (1228, 2048, 820))
+        sparse = split_context(4096, _sparse_config())
+        self.assertEqual((sparse.gpu, sparse.dram, sparse.ssd), (1232, 2048, 816))
+        self.assertEqual(gpu_resident_tokens(4096, 0.3), 1228)
+        self.assertEqual(gpu_resident_tokens(4096, 0.3, 4), 1232)
+        self.assertEqual(gpu_resident_blocks(4096, 16, 0.3), 77)
+        self.assertEqual(gpu_resident_blocks(4096, 16, 0.3, 4), 77)
+        cost = fetch_cost(4096, _sparse_config(), 327_680)
+        self.assertEqual((cost.dram_tokens, cost.ssd_tokens), (0, 0))
+        self.assertEqual(cost.ssd_ios, 0)
+        spill = spill_cost(4096, _sparse_config(), 327_680)
+        self.assertEqual(spill.ssd_tokens, 816)
+        self.assertEqual(spill.dram_tokens, 2048)
+
+    def test_s2048_full_ssd_is_410_sparse_fetch_still_zero(self):
+        full = split_context(2048, _hier_config())
+        self.assertEqual((full.gpu, full.dram, full.ssd), (614, 1024, 410))
+        self.assertLess(full.ssd, 820)
+        sparse = fetch_cost(2048, _sparse_config(), 327_680)
+        self.assertEqual((sparse.dram_tokens, sparse.ssd_tokens), (0, 0))
+        end = fetch_cost(4096, _sparse_config(), 327_680)
+        self.assertEqual((end.dram_tokens, end.ssd_tokens), (0, 0))
+
+    def test_s1024_gpu10_window256_reads_dram_only(self):
+        config = _sparse_config(gpu_frac=0.1, dram_frac=0.5, ssd_frac=0.4)
+        split = split_context(1024, config)
+        self.assertEqual(split.gpu, 106)
+        cost = fetch_cost(1024, config, SIZE_PER_TOKEN)
+        self.assertEqual((cost.dram_tokens, cost.ssd_tokens), (154, 0))
+
+    def test_short_context_reads_full_cold_set(self):
+        config = _sparse_config()
+        split = split_context(100, config)
+        self.assertEqual((split.gpu, split.dram, split.ssd), (34, 50, 16))
+        cost = fetch_cost(100, config, SIZE_PER_TOKEN)
+        self.assertEqual((cost.dram_tokens, cost.ssd_tokens), (50, 16))
+
+    def test_s4096_gpu30_dram0_ssd70_full_reads_ssd_sparse_does_not(self):
+        full = WorkingSetConfig(
+            enabled=True,
+            placement="sliding_window",
+            gpu_frac=0.3,
+            dram_frac=0.0,
+            ssd_frac=0.7,
+            overlap="blocking",
+            ssd=MediaReadConfig(read_latency_us=13.0, read_bw_gbps=14.0),
+        )
+        sparse = _sparse_config(gpu_frac=0.3, dram_frac=0.0, ssd_frac=0.7)
+        full_split = split_context(4096, full)
+        sparse_split = split_context(4096, sparse)
+        self.assertEqual((full_split.gpu, full_split.dram, full_split.ssd), (1228, 0, 2868))
+        self.assertEqual(
+            (sparse_split.gpu, sparse_split.dram, sparse_split.ssd), (1232, 0, 2864)
+        )
+        full_cost = fetch_cost(4096, full, 327_680)
+        sparse_cost = fetch_cost(4096, sparse, 327_680)
+        self.assertEqual((full_cost.dram_tokens, full_cost.ssd_tokens), (0, 2868))
+        self.assertGreater(full_cost.ssd_ios, 0)
+        self.assertEqual((sparse_cost.dram_tokens, sparse_cost.ssd_tokens), (0, 0))
+        self.assertEqual(sparse_cost.ssd_ios, 0)
+        spill = spill_cost(4096, sparse, 327_680)
+        self.assertEqual((spill.dram_tokens, spill.ssd_tokens), (0, 2864))
+
+    def test_sparse_keeps_middle_kv_and_attends_sink_window(self):
+        config = _sparse_config()
+        split = split_context(4096, config)
+        self.assertEqual((split.gpu, split.dram, split.ssd), (1232, 2048, 816))
+        self.assertEqual(attention_tokens(4096, config), 260)
+        self.assertEqual(attention_tokens(4096, _hier_config()), 4096)
+
+        class _RecordRoofline(_RooflineStub):
+            def __init__(self):
+                self.calls = []
+
+            def Compute_Timebreakdown_Iteration(
+                self,
+                prefill_len,
+                generation_idx,
+                batch_size,
+                model,
+                hardware,
+                Pipeline_Stage,
+            ):
+                self.calls.append((prefill_len, generation_idx, batch_size))
+                return 0.01, 0.0001 * (prefill_len + generation_idx)
+
+        rf = _RecordRoofline()
+        backend = RooflineLatencyBackend(
+            rf,
+            "model",
+            "hardware",
+            ParallelConfig(),
+            working_set_config=config,
+        )
+        backend.estimate_step_latency(
+            [_decode_request(prefill_len=2048, generation_idx=2048)]
+        )
+        attn_calls = [c for c in rf.calls if c[2] == 1]
+        self.assertTrue(attn_calls)
+        prompt, step, _ = attn_calls[-1]
+        self.assertEqual(prompt + step, 260)
+
+
+def _streaming_config(
+    sink_tokens: int = 4,
+    window_tokens: int = 256,
+) -> WorkingSetConfig:
+    return WorkingSetConfig(
+        enabled=True,
+        placement="sliding_window",
+        gpu_frac=1.0,
+        dram_frac=0.0,
+        ssd_frac=0.0,
+        overlap="blocking",
+        streaming_attention=True,
+        sink_tokens=sink_tokens,
+        window_tokens=window_tokens,
+    )
+
+
+class WorkingSetStreamingAttentionTest(unittest.TestCase):
+    def test_retained_tokens_sink_window_no_double_count(self):
+        self.assertEqual(retained_tokens(100, 4, 256), 100)
+        self.assertEqual(retained_tokens(260, 4, 256), 260)
+        self.assertEqual(retained_tokens(4096, 4, 256), 260)
+        self.assertEqual(retained_tokens(4, 4, 256), 4)
+        self.assertEqual(retained_tokens(0, 4, 256), 0)
+
+    def test_streaming_split_evicts_middle(self):
+        split = split_context(4096, _streaming_config())
+        self.assertEqual((split.gpu, split.dram, split.ssd), (260, 0, 0))
+        self.assertEqual(split.sink, 4)
+        self.assertEqual(gpu_resident_tokens(4096, 1.0, 4, 256, True), 260)
+        self.assertEqual(gpu_resident_blocks(4096, 16, 1.0, 4, 256, True), 17)
+
+    def test_streaming_fetch_and_spill_are_zero(self):
+        config = _streaming_config()
+        cost = fetch_cost(4096, config, 327_680)
+        self.assertEqual((cost.dram_tokens, cost.ssd_tokens), (0, 0))
+        self.assertEqual(cost.latency, 0.0)
+        spill = spill_cost(4096, config, 327_680)
+        self.assertEqual(spill.latency, 0.0)
+        self.assertEqual((spill.dram_bytes, spill.ssd_bytes), (0, 0))
+        req = _LatencyRequest(prefill_len=2048, generation_idx=0, is_prefill=True)
+        req.decode_len = 2048
+        self.assertEqual(
+            spill_cost_for_requests([req], config, 327_680).latency, 0.0
+        )
+
+    def test_trim_keeps_sink_and_window(self):
+        mgr = BlockManager(
+            block_size=16,
+            num_gpu_blocks=256,
+            num_cpu_blocks=8,
+            gpu_frac=1.0,
+            watermark=0,
+            sink_tokens=4,
+            window_tokens=256,
+            streaming_attention=True,
+        )
+        req = Request(id=1, prefill_len=512, decode_len=16, block_size=16)
+        mgr.allocate(req)
+        self.assertEqual(mgr.block_table.get_num_blocks(1), 32)
+        req.generation_idx = 1
+        spilled = mgr.trim_to_gpu_target(req)
+        self.assertEqual(mgr.block_table.get_num_blocks(1), 17)
+        self.assertEqual(spilled, 15)
+        kept = mgr.block_table.get_blocks(1)
+        all_blocks = list(range(32))
+        # First block is sink; last 16 are the window.
+        self.assertEqual(kept[0].block_number, 0)
+        self.assertEqual([b.block_number for b in kept[1:]], list(range(16, 32)))
+        self.assertEqual(len(all_blocks) - 17, spilled)
+
+    def test_decode_admits_more_after_streaming_trim(self):
+        mgr = BlockManager(
+            block_size=16,
+            num_gpu_blocks=64,
+            num_cpu_blocks=8,
+            gpu_frac=1.0,
+            watermark=0,
+            sink_tokens=4,
+            window_tokens=256,
+            streaming_attention=True,
+        )
+        fitted = []
+        for req_id in range(10):
+            req = Request(id=req_id, prefill_len=384, decode_len=1, block_size=16)
+            if not mgr.can_allocate(req):
+                break
+            mgr.allocate(req)
+            req.generation_idx = 1
+            mgr.trim_to_gpu_target(req)
+            fitted.append(req)
+        self.assertEqual(len(fitted), 3)
+        self.assertEqual(mgr.block_table.get_num_blocks(0), 17)
+
+    def test_decode_attention_uses_retained_context(self):
+        class _RecordRoofline(_RooflineStub):
+            def __init__(self):
+                self.calls = []
+
+            def Compute_Timebreakdown_Iteration(
+                self,
+                prefill_len,
+                generation_idx,
+                batch_size,
+                model,
+                hardware,
+                Pipeline_Stage,
+            ):
+                self.calls.append((prefill_len, generation_idx, batch_size))
+                return 0.01, 0.0001 * (prefill_len + generation_idx)
+
+        full_rf = _RecordRoofline()
+        sparse_rf = _RecordRoofline()
+        request = _decode_request(prefill_len=2048, generation_idx=2048)
+        full = RooflineLatencyBackend(full_rf, "model", "hardware", ParallelConfig())
+        streaming = RooflineLatencyBackend(
+            sparse_rf,
+            "model",
+            "hardware",
+            ParallelConfig(),
+            working_set_config=_streaming_config(),
+        )
+        full_lat = full.estimate_step_latency([request])
+        stream_lat = streaming.estimate_step_latency([request])
+        self.assertLess(stream_lat, full_lat)
+        attn_calls = [c for c in sparse_rf.calls if c[2] == 1]
+        self.assertTrue(attn_calls)
+        prompt, step, _ = attn_calls[-1]
+        self.assertEqual(prompt + step, 260)
+
+    def test_prefill_attention_stays_full_length(self):
+        class _RecordRoofline(_RooflineStub):
+            def __init__(self):
+                self.calls = []
+
+            def Compute_Timebreakdown_Iteration(
+                self,
+                prefill_len,
+                generation_idx,
+                batch_size,
+                model,
+                hardware,
+                Pipeline_Stage,
+            ):
+                self.calls.append((prefill_len, generation_idx, batch_size))
+                return 0.01, 0.001
+
+        rf = _RecordRoofline()
+        request = _LatencyRequest(
+            prefill_len=2048, generation_idx=0, is_prefill=True
+        )
+        backend = RooflineLatencyBackend(
+            rf,
+            "model",
+            "hardware",
+            ParallelConfig(),
+            working_set_config=_streaming_config(),
+        )
+        disabled = RooflineLatencyBackend(
+            _RooflineStub(), "model", "hardware", ParallelConfig()
+        )
+        self.assertAlmostEqual(
+            backend.estimate_step_latency([request]),
+            disabled.estimate_step_latency([request]),
+        )
 
 
 class WorkingSetGqaCacheTest(unittest.TestCase):

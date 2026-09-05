@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from TokenSim.config.constants import _GB
 from TokenSim.kv_working_set.config import (
     IO_SIZE_COALESCED,
-    QD_LATENCY_KNEE,
     MediaReadConfig,
     WorkingSetConfig,
 )
@@ -76,12 +75,7 @@ def qd_latency_us(
     qd = max(1, int(qd))
     if media.qd_latency_us:
         return _interpolate_qd_latency_us(media.qd_latency_us, float(qd))
-    base = (
-        media.effective_write_latency_us() if write else media.read_latency_us
-    )
-    if qd <= QD_LATENCY_KNEE:
-        return base
-    return base * (qd / QD_LATENCY_KNEE)
+    return media.effective_write_latency_us() if write else media.read_latency_us
 
 
 def media_queue_latency(
@@ -91,7 +85,11 @@ def media_queue_latency(
     *,
     write: bool = False,
 ) -> float:
-    """Roofline: max(command drain, transfer). Prefill is not charged here."""
+    """Roofline: max(n_ios × L / QD, bytes / BW). Prefill is not charged here.
+
+    Without a ``qd_latency_us`` table, L is the configured media latency
+    (does not grow with QD). Saturated IOPS is ``min(qd_cap / L, BW / io)``.
+    """
     if bytes_ <= 0 or media is None:
         return 0.0
     bw = (
@@ -149,15 +147,33 @@ def fetch_cost(
     config: WorkingSetConfig,
     size_per_token: int,
 ) -> FetchCost:
-    """Charge DRAM/SSD reads for the whole cold set ``[0, gpu_start)``.
+    """Charge DRAM/SSD reads for tokens that must be fetched this decode step.
 
-    Full attention needs every historical K/V each decode step. Tokens not in
-    the GPU window stay on DRAM/SSD, so this range is I/O every step — not a
-    once-per-request page-in.
+    Default: the whole cold set ``[0, gpu_start)``. With ``config.sparse``,
+    only ``window ∩ cold`` (the attended set that misses GPU); sink is
+    GPU-resident and is not reread. StreamingLLM eviction
+    (``streaming_attention``) has no cold set.
     """
+    if config.streaming_attention:
+        split = split_context(context_len, config)
+        return FetchCost(
+            latency=0.0,
+            dram_tokens=0,
+            ssd_tokens=0,
+            dram_bytes=0,
+            ssd_bytes=0,
+            split=split,
+        )
     split = split_context(context_len, config)
     size_per_token = max(0, int(size_per_token))
-    miss_start = 0
+    if config.sparse:
+        window = max(0, int(config.window_tokens))
+        win_start = max(0, context_len - window)
+        cold_start = split.sink
+    else:
+        win_start = 0
+        cold_start = 0
+    miss_start = max(win_start, cold_start)
     miss_end = split.gpu_start
     dram_tokens = _overlap(miss_start, miss_end, split.dram_start, split.gpu_start)
     ssd_tokens = _overlap(miss_start, miss_end, split.ssd_start, split.dram_start)
@@ -251,7 +267,11 @@ def _spill_context_len(req: object) -> int:
 
 
 def request_will_trim(req: object, config: WorkingSetConfig) -> bool:
-    if not config.enabled or config.gpu_frac >= 1.0:
+    if not config.enabled:
+        return False
+    if config.streaming_attention:
+        return False
+    if config.gpu_frac >= 1.0:
         return False
     decode_len = int(getattr(req, "decode_len", 1) or 0)
     generation_idx = int(getattr(req, "generation_idx", 0) or 0)
@@ -267,7 +287,20 @@ def spill_cost(
     config: WorkingSetConfig,
     size_per_token: int,
 ) -> FetchCost:
-    """Charge DRAM/SSD writes plus shared PCIe for the cold set after trim."""
+    """Charge DRAM/SSD writes plus shared PCIe for the cold set after trim.
+
+    StreamingLLM eviction does not write the discarded middle KV.
+    """
+    if config.streaming_attention:
+        split = split_context(context_len, config)
+        return FetchCost(
+            latency=0.0,
+            dram_tokens=0,
+            ssd_tokens=0,
+            dram_bytes=0,
+            ssd_bytes=0,
+            split=split,
+        )
     split = split_context(context_len, config)
     size_per_token = max(0, int(size_per_token))
     dram_tokens = split.dram
@@ -305,7 +338,12 @@ def spill_cost_for_requests(
         ssd_bytes=0,
         split=split_context(0, config),
     )
-    if not config.enabled or config.gpu_frac >= 1.0 or not requests:
+    if (
+        not config.enabled
+        or config.streaming_attention
+        or config.gpu_frac >= 1.0
+        or not requests
+    ):
         return empty
     dram_tokens = 0
     ssd_tokens = 0

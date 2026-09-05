@@ -1,0 +1,26 @@
+request_time=MetricData(p50=127.11749821433557, p99=131.63935541170378, max=131.85353356917403)
+prefill_time=MetricData(p50=0.2815794646096492, p99=0.31870253997161396, max=0.3193117999032893)
+decode_time=MetricData(p50=0.06200510976856218, p99=0.063980001741734, max=0.06405383198104612)
+decode_max_time=MetricData(p50=0.3204518604297846, p99=0.3227605649767611, max=0.3227605649767611)
+prefill_idle_time=MetricData(p50=0.1051302767478533, p99=0.19381036975310464, max=0.195851566087342)
+decode_idle_time=MetricData(p50=0.00998909910169804, p99=0.025177222111000777, max=0.02534997890777857)
+Average prefill latency: 0.28239070080375656
+Max prefill latency: 0.3193117999032893
+Min prefill latency: 0.24629146801316892
+Average decode latency: 0.062166171806285385
+Max decode latency: 0.06405383198104612
+Min decode latency: 0.06007264093088571
+total time: 2421.636448852239
+Thoughput: 0.04129439001770728 r/s, 84.58164729766911 token/s
+Total preemptions: 0
+Prefix cache: hit_blocks=0, miss_blocks=0, hit_tokens=0, effective_prefill_tokens=204826, hit_rate=0
+KV connector: transfers=0, blocks=0, bytes=0, latency=0.0, load_wait=0.0, save_wait=0.0
+Parallel: config={'tensor_parallel_size': 1, 'pipeline_parallel_size': 1, 'data_parallel_size': 1, 'data_parallel_rank': 0, 'data_parallel_size_local': 1, 'tensor_parallel_collective_latency_scale': 1.0, 'pipeline_parallel_activation_latency_scale': 1.0, 'enable_expert_parallel': False, 'expert_placement_strategy': 'linear', 'all2all_backend': 'allgather_reducescatter'}, ranks=1/1, dp_placements={}, sync_events=0, sync_latency=0.0
+MoE: disabled
+Prefill SLO Good Throughput: 100 r, 0.04129439001770728 r/s
+Max-Decode SLO Good Throughput: 1 r, 0.0004129439001770728 r/s
+Prefill and Max-Decode SLO Good Throughput: 1 r, 0.0004129439001770728 r/s
+Decode SLO Good Throughput: 100 r, 0.04129439001770728 r/s
+Prefill and Decode SLO Good Throughput: 100 r, 0.04129439001770728 r/s
+/home/kewei/.local/lib/python3.11/site-packages/simpy/__init__.py:11: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import get_distribution

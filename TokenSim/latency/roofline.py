@@ -10,6 +10,7 @@ from TokenSim.kv_working_set.fetch import (
     decode_fetch_for_requests,
     layer_prefetch_step_latency,
 )
+from TokenSim.kv_working_set.placement import attention_tokens
 from TokenSim.kv_working_set.stats import WorkingSetStats
 from TokenSim.latency.base import (
     DECODE_SCALE,
@@ -114,9 +115,10 @@ class RooflineLatencyBackend(LatencyBackend):
                 if getattr(req, "needs_recompute", False)
                 else req.prefill_compute_len if req.is_prefill else req.prefill_len
             )
+            attn_prompt, attn_step = self._attention_args(req, prefill_len)
             _, attn_latency = self._timebreakdown(
-                backend_prefill_len(prefill_len),
-                0 if getattr(req, "needs_recompute", False) else req.generation_idx,
+                backend_prefill_len(attn_prompt),
+                attn_step,
                 # TODO: check the num "1" here
                 1,
             )
@@ -175,6 +177,19 @@ class RooflineLatencyBackend(LatencyBackend):
         cost = decode_fetch_for_requests(requests, config, self.size_per_token)
         self.kv_ws_stats.record_fetch(cost)
         return cost.latency
+
+    def _attention_args(self, req: Request, prefill_len: int) -> tuple[int, int]:
+        """Roofline (prompt_len, step) for attention. Prefill stays full length."""
+        if getattr(req, "needs_recompute", False):
+            return prefill_len, 0
+        if req.is_prefill:
+            return prefill_len, req.generation_idx
+        config = self.working_set_config
+        if config is not None and (config.streaming_attention or config.sparse):
+            context = int(prefill_len) + int(req.generation_idx)
+            attn_ctx = max(1, attention_tokens(context, config))
+            return max(1, attn_ctx - 1), 1
+        return prefill_len, req.generation_idx
 
     def _timebreakdown(
         self,
