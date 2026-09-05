@@ -128,7 +128,7 @@ python3.11 benchmark.py --batching paged-attn --qps 0.32 --distribution poisson 
 | --- | --- |
 | **λ\*** | Swept, not a target: largest **stable** offered Poisson QPS for this config. / 扫出来的膝点，不是预期 QPS：该配置还能稳住的最大到达率 |
 | **N\*** | Little **estimate** at λ\*: `offered_qps × request_time.p50` (queue + prefill + decode). Not a scheduler count; uses offered rate even when goodput is below 1. A float (e.g. 15.96) is an average. / Little 估计，不是数出来的并发 |
-| **Peak B** | HBM occupancy **ceiling** at S=1024 after watermark (`4103 / ceil(floor(1024×gpu_frac)/16)`). How many decode windows fit, not how many are in flight. / 显存装得下多少条，不是 N* |
+| **Peak B** | HBM occupancy **ceiling** at S=1024 after watermark: `floor(4103 / ceil(floor(1024×gpu_frac)/16))`. How many decode windows fit, not how many are in flight. / 显存装得下多少条，不是 N* |
 | **Peak DRAM / SSD** | Derived host occupancy at Peak B, S=1024. Simulator does **not** cap DRAM or SSD. |
 | **TTFT** | `prefill_time` (queue wait + prefill + trim spill) |
 | **TPOT** | `decode_time` **p50**: median across requests of each request's **mean** inter-token interval. Tables labeled TPOT p50. / 每条请求先对 decode 步取均值，再对 100 条取中位数 |
@@ -242,7 +242,7 @@ Decode 占用随 `gpu_frac` 变；每个点自己扫 `λ*`。Prefill Peak B 为 
 | 15% | 410 | 0.26 | 13.06 | 248.8 | 96.5 ms | 0.12 s | 0.20 s | 0 |
 | 10% | 586 | 0.26 | 15.99 | 240.6 | 118.1 ms | 0.12 s | 0.26 s | 0 |
 
-Down to **75%** the knee matches all-GPU (`λ*=0.60`, ~554 tok/s). Then `λ*` and token/s fall smoothly as the cold set grows. At 10% GQA still holds `λ*=0.26` / **240.6** tok/s — the MHA companion collapsed to the light-load floor (`λ*=0.02`) at 20%. There is **no TTFT p50 cliff**. Small TPOT wiggles (50% → 45%, 20% → 15%) are `λ*` step-downs at each row’s own knee, not a faster decode at lower HBM.
+Down to **75%** the knee matches all-GPU (`λ*=0.60`, ~554 tok/s). Then `λ*` and token/s fall smoothly as the cold set grows. At 10% GQA still holds `λ*=0.26` / **240.6** tok/s — the MHA companion collapsed to the light-load floor (`λ*=0.02`) at 20%. There is **no TTFT p50 cliff**. Small TPOT wiggles (50% → 45%, 20% → 15%) are `λ*` step-downs at each row’s own knee, not a faster decode at lower HBM. 70% → 65% and 60% → 55% also step `λ*` down, but TPOT still rises.
 
 75% 以上与全 GPU 膝点相同。10% 仍能稳住 0.26 r/s；MHA 在 20% 已退回轻载 0.02。没有 TTFT p50 悬崖。
 

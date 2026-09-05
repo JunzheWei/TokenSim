@@ -129,7 +129,7 @@ python3.11 benchmark.py --batching paged-attn --qps 0.04 --distribution poisson 
 | --- | --- |
 | **λ\*** | Swept, not a target: largest **stable** offered Poisson QPS for this config. / 扫出来的膝点，不是预期 QPS：该配置还能稳住的最大到达率 |
 | **N\*** | Little **estimate** at λ\*: `offered_qps × request_time.p50` (queue + prefill + decode). Not a scheduler count; uses offered rate even when goodput is below 1. A float (e.g. 6.37) is an average. / Little 估计，不是数出来的并发 |
-| **Peak B** | HBM occupancy **ceiling** at S=1024 after watermark (`513 / ceil(floor(1024×gpu_frac)/16)`). How many decode windows fit, not how many are in flight. / 显存装得下多少条，不是 N* |
+| **Peak B** | HBM occupancy **ceiling** at S=1024 after watermark: `floor(513 / ceil(floor(1024×gpu_frac)/16))`. How many decode windows fit, not how many are in flight. / 显存装得下多少条，不是 N* |
 | **Peak DRAM / SSD** | Derived host occupancy at Peak B, S=1024. Simulator does **not** cap DRAM or SSD. |
 | **TTFT** | `prefill_time` (queue wait + prefill + trim spill) |
 | **TPOT** | `decode_time` **p50**: median across requests of each request's **mean** inter-token interval. Tables labeled TPOT p50. / 每条请求先对 decode 步取均值，再对 100 条取中位数 |

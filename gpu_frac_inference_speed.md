@@ -12,7 +12,7 @@ Each `gpu_frac` has its own `λ*` — **swept, not a target**: the largest stabl
 **Peak B** (decode, S=1024) after watermark:
 
 ```text
-Peak B = 513 / ceil(floor(1024 × gpu_frac) / 16)
+Peak B = floor(513 / ceil(floor(1024 × gpu_frac) / 16))
 ```
 
 Prefill Peak B at S=512 is always **16**.

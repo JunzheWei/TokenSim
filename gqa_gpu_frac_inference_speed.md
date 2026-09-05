@@ -7,14 +7,14 @@ Prefill / recompute charge **full** context on HBM. After those steps, decode oc
 
 Source: [`gqa_working_set_test_report/gpu_frac_sweep/summary.json`](gqa_working_set_test_report/gpu_frac_sweep/summary.json)
 
-Each `gpu_frac` has its own `λ*` — **swept, not a target**: the largest stable offered QPS. Token/s and TPOT are **at that knee**, not at a shared arrival rate. `N* = offered λ* × request_time.p50` is a Little **estimate** of average in-flight requests, not a scheduler count. Peak B is the HBM occupancy ceiling (4103 available GPU blocks after 1% watermark), not N*.
+Each `gpu_frac` has its own `λ*` — **swept, not a target**: the largest stable offered QPS (goodput ≥ 0.90 and TTFT p99 ≤ 3× light-load). Token/s and TPOT are **at that knee**, not at a shared arrival rate. `N* = offered λ* × request_time.p50` is a Little **estimate** of average in-flight requests, not a scheduler count. Peak B is the HBM occupancy ceiling (4103 available GPU blocks after 1% watermark), not N*.
 
 `λ*` 不是预期到达率，是该 `gpu_frac` 还能稳住的最大到达率。`N*` 是 Little 估计，不是数出来的并发。
 
 **Peak B** (decode, S=1024) after watermark:
 
 ```text
-Peak B = 4103 / ceil(floor(1024 × gpu_frac) / 16)
+Peak B = floor(4103 / ceil(floor(1024 × gpu_frac) / 16))
 ```
 
 Prefill Peak B at S=512 is always **128**.
@@ -55,9 +55,9 @@ Peak B 变大伴随着更大的冷集，膝点 token/s 不会随占用上升。
 
 ![TTFT p50 and TPOT p50 vs gpu_frac](gqa_working_set_test_report/gpu_frac_sweep/fig_ttft_tpot_frac.png)
 
-TPOT p50 stays near 64 ms through 75%, then rises toward 96–118 ms as `gpu_frac` falls. Each point is at **its own knee**. Small dips (50% → 45%, 20% → 15%) are `λ*` step-downs, not a faster loaded decode. TTFT p50 stays ~0.10–0.12 s.
+TPOT p50 stays near 64 ms through 75%, then rises as `gpu_frac` falls: **96.0 ms at 30%**, **98.5 ms at 25%**, **118.1 ms at 10%**. Each point is at **its own knee**. Small TPOT dips (50% → 45%: 80.0 → 79.4 ms; 20% → 15%: 98.9 → 96.5 ms) are `λ*` step-downs, not a faster loaded decode. 70% → 65% and 60% → 55% also step `λ*` down, but TPOT still rises (65.0 → 69.0 ms, 74.5 → 77.5 ms). TTFT p50 stays ~0.10–0.12 s at every row; TTFT p99 is ~0.20 s at 30% and 0.26 s at 10%.
 
-TPOT 随冷集变大而变长。各行在各自膝点采集。膝点 TTFT p50 都在约 0.12 s。
+TPOT 在 75% 以上约 64 ms，随后升到 30% 的 96 ms、10% 的 118 ms。50%→45%、20%→15% 有小回落，是 `λ*` 降档。70%→65%、60%→55% 也降档，但 TPOT 仍在升。膝点 TTFT p50 各行都在约 0.10–0.12 s；p99 在低 `gpu_frac` 升到 0.20–0.26 s。
 
 ---
 

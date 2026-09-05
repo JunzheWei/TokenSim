@@ -113,7 +113,7 @@ def main() -> None:
     ax.set_ylabel("System token/s at Poisson knee")
     ax.set_title(
         "GQA-8 knee token/s vs GPU KV fraction — 128KiB DMA + layer prefetch\n"
-        f"Peak B = {avail} GPU blocks / ceil(floor(1024 × gpu_frac) / 16)"
+        f"Peak B = floor({avail} / ceil(floor(1024 × gpu_frac) / 16))"
     )
     ax.set_xticks(pcts)
     ax.set_xticklabels([f"{p}%" for p in pcts], rotation=45, ha="right")
