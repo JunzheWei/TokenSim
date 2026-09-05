@@ -9,6 +9,7 @@
   "sparse": true,
   "sink_tokens": 4,
   "window_tokens": 256,
+  "select_tokens": 0,
   "ssd": {
     "read_latency_us": 13.0,
     "read_bw_gbps": 14.0,

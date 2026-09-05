@@ -61,6 +61,21 @@ class WorkingSetConfig:
     streaming_attention: bool = False
     sink_tokens: int = 4
     window_tokens: int = 256
+    # Importance-based page selection (Quest-style top-k), statistical model:
+    # decode attends sink ∪ k selected tokens; selection is uniform over the
+    # non-sink context, so the cold share of k is fetched each step.
+    # 0 keeps the sliding-window selection. Requires ``sparse``.
+    select_tokens: int = 0
+    # Plan C on top of select_tokens: a per-request GPU page cache holding
+    # recently selected cold pages (extra GPU residency beyond gpu_frac), and
+    # the fraction of each step's selection that repeats the previous step.
+    # Cold hit ratio = reuse + (1 - reuse) × min(1, cache / hole).
+    select_cache_tokens: int = 0
+    select_reuse: float = 0.0
+
+    def attended_span(self) -> int:
+        """Tokens attended beyond sink: top-k selection if set, else window."""
+        return self.select_tokens if self.select_tokens > 0 else self.window_tokens
 
     def __post_init__(self) -> None:
         if self.placement not in SUPPORTED_PLACEMENTS:
@@ -100,6 +115,33 @@ class WorkingSetConfig:
         if self.window_tokens < 0:
             raise ConfigurationError(
                 f"window_tokens must be >= 0, got {self.window_tokens}"
+            )
+        if self.select_tokens < 0:
+            raise ConfigurationError(
+                f"select_tokens must be >= 0, got {self.select_tokens}"
+            )
+        if self.select_tokens > 0 and (not self.sparse or self.streaming_attention):
+            raise ConfigurationError(
+                "select_tokens requires sparse=true and streaming_attention=false"
+            )
+        if self.select_cache_tokens < 0:
+            raise ConfigurationError(
+                f"select_cache_tokens must be >= 0, got {self.select_cache_tokens}"
+            )
+        if not 0.0 <= self.select_reuse < 1.0:
+            raise ConfigurationError(
+                f"select_reuse must be in [0, 1), got {self.select_reuse}"
+            )
+        if (self.select_cache_tokens > 0 or self.select_reuse > 0.0) and (
+            self.select_tokens <= 0
+        ):
+            raise ConfigurationError(
+                "select_cache_tokens / select_reuse require select_tokens > 0"
+            )
+        if 0 < self.select_cache_tokens < self.select_tokens:
+            raise ConfigurationError(
+                "select_cache_tokens must hold one step's selection "
+                f"(>= select_tokens={self.select_tokens}), got {self.select_cache_tokens}"
             )
 
     def any_queueing(self) -> bool:
@@ -152,6 +194,9 @@ class WorkingSetConfig:
             streaming_attention=bool(payload.get("streaming_attention", False)),
             sink_tokens=int(payload.get("sink_tokens", 4)),
             window_tokens=int(payload.get("window_tokens", 256)),
+            select_tokens=int(payload.get("select_tokens", 0)),
+            select_cache_tokens=int(payload.get("select_cache_tokens", 0)),
+            select_reuse=float(payload.get("select_reuse", 0.0)),
         )
 
 

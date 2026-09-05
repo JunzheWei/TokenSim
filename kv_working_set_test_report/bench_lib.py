@@ -58,6 +58,7 @@ def peak_b(
     sink_tokens: int = 0,
     window_tokens: int = 0,
     streaming_attention: bool = False,
+    cache_tokens: int = 0,
 ) -> int:
     blocks = gpu_resident_blocks(
         context,
@@ -66,6 +67,7 @@ def peak_b(
         sink_tokens,
         window_tokens,
         streaming_attention,
+        cache_tokens,
     )
     if blocks <= 0:
         return 0
@@ -193,11 +195,8 @@ def find_config_knee(
         kept = retained_tokens(context, sink_tokens, window_tokens)
         attn_kept = kept
     elif extra.get("sparse"):
-        attn_kept = retained_tokens(
-            context,
-            int(extra.get("sink_tokens", 0)),
-            int(extra.get("window_tokens", 0)),
-        )
+        span = int(extra.get("select_tokens", 0)) or int(extra.get("window_tokens", 0))
+        attn_kept = retained_tokens(context, int(extra.get("sink_tokens", 0)), span)
         kept = context
     else:
         attn_kept = context
@@ -217,6 +216,7 @@ def find_config_knee(
             sink_tokens=sink_tokens,
             window_tokens=window_tokens,
             streaming_attention=streaming,
+            cache_tokens=int(extra.get("select_cache_tokens", 0)),
         ),
         "peak_b_prefill": peak_b(
             1.0,

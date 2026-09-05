@@ -12,16 +12,20 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 HERE = Path(__file__).resolve().parent
-ARMS = ("all_gpu", "hier_full", "sparse_offload")
+ARMS = ("all_gpu", "hier_full", "sparse_offload", "select_offload", "cache_offload")
 LABELS = {
     "all_gpu": "all_gpu_full",
     "hier_full": "hier_full",
     "sparse_offload": "sparse_offload",
+    "select_offload": "select_offload",
+    "cache_offload": "cache_offload",
 }
 COLORS = {
     "all_gpu": "#4c78a8",
     "hier_full": "#e45756",
     "sparse_offload": "#54a24b",
+    "select_offload": "#f58518",
+    "cache_offload": "#b279a2",
 }
 
 
@@ -53,7 +57,7 @@ def plot_knee_bars(knees: dict[str, dict]) -> None:
     ttft50 = [knees[tag]["ttft_p50"] for tag in ARMS]
     ttft99 = [knees[tag]["ttft_p99"] for tag in ARMS]
 
-    fig, axes = plt.subplots(1, 3, figsize=(12.6, 4.2))
+    fig, axes = plt.subplots(1, 3, figsize=(13.6, 4.4))
     axes[0].bar(names, tok, color=colors)
     axes[0].set_ylabel("token/s")
     axes[0].set_title("System token/s at λ*")
@@ -78,6 +82,8 @@ def plot_knee_bars(knees: dict[str, dict]) -> None:
     axes[2].set_ylabel("s")
     axes[2].set_title("TTFT at λ*")
     axes[2].legend()
+    for ax in axes:
+        ax.tick_params(axis="x", labelrotation=15, labelsize=9)
 
     fig.suptitle("GQA S=4096 knees — full attention vs sparse+offload")
     fig.tight_layout()

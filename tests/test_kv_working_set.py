@@ -947,6 +947,126 @@ class WorkingSetSparseFetchTest(unittest.TestCase):
         self.assertEqual(prompt + step, 260)
 
 
+def _select_config(
+    gpu_frac: float = 0.3,
+    dram_frac: float = 0.0,
+    ssd_frac: float = 0.7,
+    select_tokens: int = 256,
+    cache_tokens: int = 0,
+    reuse: float = 0.0,
+) -> WorkingSetConfig:
+    return WorkingSetConfig(
+        enabled=True,
+        placement="sliding_window",
+        gpu_frac=gpu_frac,
+        dram_frac=dram_frac,
+        ssd_frac=ssd_frac,
+        overlap="blocking",
+        sparse=True,
+        sink_tokens=4,
+        window_tokens=256,
+        select_tokens=select_tokens,
+        select_cache_tokens=cache_tokens,
+        select_reuse=reuse,
+        dram=MediaReadConfig(read_latency_us=2.0, read_bw_gbps=50.0),
+        ssd=MediaReadConfig(read_latency_us=13.0, read_bw_gbps=14.0),
+    )
+
+
+class WorkingSetSelectCacheTest(unittest.TestCase):
+    def test_cache_and_reuse_validation(self):
+        with self.assertRaises(ConfigurationError):
+            WorkingSetConfig(enabled=True, sparse=True, select_cache_tokens=512)
+        with self.assertRaises(ConfigurationError):
+            WorkingSetConfig(enabled=True, sparse=True, select_reuse=0.5)
+        with self.assertRaises(ConfigurationError):
+            _select_config(cache_tokens=128)
+        with self.assertRaises(ConfigurationError):
+            _select_config(reuse=1.0)
+        cfg = WorkingSetConfig.from_dict(
+            {"sparse": True, "select_tokens": 256, "select_cache_tokens": 512, "select_reuse": 0.8}
+        )
+        self.assertEqual((cfg.select_cache_tokens, cfg.select_reuse), (512, 0.8))
+
+    def test_cache_hit_ratio_reduces_cold_fetch(self):
+        # Uniform: hit = cache / cold; 179 × (1 - 512/2864) ≈ 147.
+        self.assertEqual(fetch_cost(4096, _select_config(cache_tokens=512), 327_680).ssd_tokens, 147)
+        self.assertEqual(fetch_cost(4096, _select_config(cache_tokens=1024), 327_680).ssd_tokens, 115)
+        # Reuse: hit = p + (1 - p) × cache / cold.
+        self.assertEqual(
+            fetch_cost(4096, _select_config(cache_tokens=512, reuse=0.8), 327_680).ssd_tokens, 29
+        )
+        self.assertEqual(
+            fetch_cost(4096, _select_config(cache_tokens=256, reuse=0.5), 327_680).ssd_tokens, 82
+        )
+        # Cache covering the whole cold set: no reads.
+        self.assertEqual(fetch_cost(4096, _select_config(cache_tokens=4096), 327_680).ssd_tokens, 0)
+
+    def test_cache_counts_toward_gpu_residency(self):
+        self.assertEqual(gpu_resident_tokens(4096, 0.3, 4, cache_tokens=512), 1744)
+        self.assertEqual(gpu_resident_blocks(4096, 16, 0.3, 4, cache_tokens=512), 109)
+        self.assertEqual(gpu_resident_tokens(4096, 0.3, 4, cache_tokens=8192), 4096)
+        self.assertEqual(gpu_resident_tokens(4096, 0.3, 4), 1232)
+        self.assertEqual(attention_tokens(4096, _select_config(cache_tokens=512, reuse=0.8)), 260)
+
+    def test_block_manager_charges_cache_blocks_for_decode_only(self):
+        manager = BlockManager(
+            block_size=16,
+            num_gpu_blocks=4144,
+            num_cpu_blocks=0,
+            gpu_frac=0.3,
+            sink_tokens=4,
+            cache_tokens=512,
+        )
+        req = Request(id=1, prefill_len=2048, decode_len=2048, block_size=16)
+        self.assertEqual(manager._gpu_target_blocks(req), 128)
+        req.generation_idx = 2048
+        self.assertEqual(manager._gpu_target_blocks(req), 109)
+
+
+class WorkingSetSelectFetchTest(unittest.TestCase):
+    def test_select_requires_sparse(self):
+        with self.assertRaises(ConfigurationError):
+            WorkingSetConfig(enabled=True, select_tokens=256)
+        with self.assertRaises(ConfigurationError):
+            WorkingSetConfig(
+                enabled=True,
+                sparse=True,
+                streaming_attention=True,
+                select_tokens=256,
+            )
+        with self.assertRaises(ConfigurationError):
+            WorkingSetConfig(enabled=True, sparse=True, select_tokens=-1)
+        self.assertEqual(
+            WorkingSetConfig.from_dict({"sparse": True, "select_tokens": 128}).select_tokens,
+            128,
+        )
+
+    def test_select_attends_sink_plus_k_and_keeps_split(self):
+        config = _select_config()
+        self.assertEqual(attention_tokens(4096, config), 260)
+        self.assertEqual(attention_tokens(100, config), 100)
+        self.assertEqual(split_context(4096, config), split_context(4096, _sparse_config(0.3, 0.0, 0.7)))
+
+    def test_select_30_0_70_fetches_uniform_cold_share_every_step(self):
+        config = _select_config()
+        for context, expected in ((2048, 179), (4096, 179)):
+            cost = fetch_cost(context, config, 327_680)
+            self.assertEqual((cost.dram_tokens, cost.ssd_tokens), (0, expected))
+            self.assertGreater(cost.ssd_ios, 0)
+            self.assertGreater(cost.latency, 0.0)
+        window = fetch_cost(4096, _sparse_config(0.3, 0.0, 0.7), 327_680)
+        self.assertEqual(window.ssd_tokens, 0)
+
+    def test_select_splits_cold_share_across_dram_and_ssd(self):
+        cost = fetch_cost(4096, _select_config(0.3, 0.5, 0.2), 327_680)
+        self.assertEqual((cost.dram_tokens, cost.ssd_tokens), (128, 51))
+
+    def test_select_short_context_reads_whole_cold_set(self):
+        cost = fetch_cost(100, _select_config(0.3, 0.5, 0.2), 327_680)
+        self.assertEqual((cost.dram_tokens, cost.ssd_tokens), (50, 16))
+
+
 def _streaming_config(
     sink_tokens: int = 4,
     window_tokens: int = 256,

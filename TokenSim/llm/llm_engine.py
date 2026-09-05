@@ -252,6 +252,7 @@ class LLMWorker(Worker):
         ws_sink = 0
         ws_window = 0
         ws_streaming = False
+        ws_cache = 0
         if working_set_config is not None and working_set_config.enabled:
             ws_gpu_frac = working_set_config.gpu_frac
             if working_set_config.sparse or working_set_config.streaming_attention:
@@ -259,6 +260,7 @@ class LLMWorker(Worker):
             if working_set_config.streaming_attention:
                 ws_window = working_set_config.window_tokens
                 ws_streaming = True
+            ws_cache = working_set_config.select_cache_tokens
 
         if batching == "paged-attn":
             self.scheduler = LLMPagedAttnScheduler(
@@ -271,6 +273,7 @@ class LLMWorker(Worker):
                 sink_tokens=ws_sink,
                 window_tokens=ws_window,
                 streaming_attention=ws_streaming,
+                cache_tokens=ws_cache,
             )
         elif batching == "static":
             self.scheduler = LLMStaticScheduler(
@@ -547,6 +550,7 @@ class LLMEngine(Worker):
         sink_tokens = 0
         window_tokens = 0
         streaming_attention = False
+        cache_tokens = 0
         working_set_config = getattr(self, "working_set_config", None)
         if working_set_config is not None and working_set_config.enabled:
             gpu_frac = working_set_config.gpu_frac
@@ -555,6 +559,7 @@ class LLMEngine(Worker):
             if working_set_config.streaming_attention:
                 window_tokens = working_set_config.window_tokens
                 streaming_attention = True
+            cache_tokens = working_set_config.select_cache_tokens
         role_pools = (
             (
                 "prefill",
@@ -573,6 +578,7 @@ class LLMEngine(Worker):
                     sink_tokens,
                     window_tokens,
                     streaming_attention,
+                    cache_tokens,
                 ),
             ),
         )

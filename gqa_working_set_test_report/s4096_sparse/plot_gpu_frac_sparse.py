@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sys
+from itertools import product
 from math import floor
 from pathlib import Path
 
@@ -63,7 +64,7 @@ def _style() -> None:
     )
 
 
-def _sparse_config(gpu_frac: float) -> WorkingSetConfig:
+def _sparse_config(gpu_frac: float, select_tokens: int = 0) -> WorkingSetConfig:
     return WorkingSetConfig(
         enabled=True,
         placement="sliding_window",
@@ -74,6 +75,7 @@ def _sparse_config(gpu_frac: float) -> WorkingSetConfig:
         sparse=True,
         sink_tokens=SINK,
         window_tokens=WINDOW,
+        select_tokens=select_tokens,
         ssd=SSD,
     )
 
@@ -84,6 +86,7 @@ def sweep_fetch_cost() -> list[dict]:
     for step in range(2, 31):
         gpu_frac = step / 100.0
         config = _sparse_config(gpu_frac)
+        select = _sparse_config(gpu_frac, select_tokens=WINDOW)
         row: dict = {"gpu_frac": gpu_frac}
         for context, key in ((PREFILL, "prefill"), (CONTEXT, "end")):
             split = split_context(context, config)
@@ -94,6 +97,9 @@ def sweep_fetch_cost() -> list[dict]:
             row[f"{key}_ssd"] = split.ssd
             row[f"{key}_fetch_ssd"] = cost.ssd_tokens
             row[f"{key}_fetch_ms"] = cost.latency * 1e3
+            sel_cost = fetch_cost(context, select, SIZE_PER_TOKEN)
+            row[f"{key}_select_fetch_ssd"] = sel_cost.ssd_tokens
+            row[f"{key}_select_fetch_ms"] = sel_cost.latency * 1e3
         row["peak_b"] = peak_b(
             gpu_frac,
             context=CONTEXT,
@@ -124,6 +130,20 @@ def plot_fetch(rows: list[dict]) -> None:
         color="#e45756",
         label="S=4096 (decode end)",
     )
+    axes[0].plot(
+        xs,
+        [r["prefill_select_fetch_ssd"] for r in rows],
+        linestyle=":",
+        color="#4c78a8",
+        label="select256 S=2048",
+    )
+    axes[0].plot(
+        xs,
+        [r["end_select_fetch_ssd"] for r in rows],
+        linestyle=":",
+        color="#e45756",
+        label="select256 S=4096",
+    )
     axes[0].axvline(12.5, color="#4c78a8", linestyle="--", linewidth=1, alpha=0.7)
     axes[0].axvline(6.25, color="#e45756", linestyle="--", linewidth=1, alpha=0.7)
     axes[0].set_xlabel("gpu_frac (%)")
@@ -148,6 +168,20 @@ def plot_fetch(rows: list[dict]) -> None:
         color="#e45756",
         label="S=4096",
     )
+    axes[1].plot(
+        xs,
+        [r["prefill_select_fetch_ms"] for r in rows],
+        linestyle=":",
+        color="#4c78a8",
+        label="select256 S=2048",
+    )
+    axes[1].plot(
+        xs,
+        [r["end_select_fetch_ms"] for r in rows],
+        linestyle=":",
+        color="#e45756",
+        label="select256 S=4096",
+    )
     axes[1].axvline(12.5, color="#4c78a8", linestyle="--", linewidth=1, alpha=0.7)
     axes[1].axvline(6.25, color="#e45756", linestyle="--", linewidth=1, alpha=0.7)
     axes[1].set_xlabel("gpu_frac (%)")
@@ -157,7 +191,7 @@ def plot_fetch(rows: list[dict]) -> None:
     axes[1].set_xlim(31, 1)
 
     fig.suptitle(
-        "Sparse decode, dram_frac=0 — window=256  "
+        "Sparse decode, dram_frac=0 — solid: window=256, dotted: uniform select256  "
         "(dashed: 12.5% start / 6.25% end)"
     )
     fig.tight_layout()
@@ -167,7 +201,7 @@ def plot_fetch(rows: list[dict]) -> None:
     print("wrote", path)
 
 
-def _payload(gpu_frac: float) -> dict:
+def _payload(gpu_frac: float, select_tokens: int = 0) -> dict:
     return {
         "enabled": True,
         "placement": "sliding_window",
@@ -179,6 +213,7 @@ def _payload(gpu_frac: float) -> dict:
         "sparse": True,
         "sink_tokens": SINK,
         "window_tokens": WINDOW,
+        "select_tokens": select_tokens,
         "ssd": {
             "read_latency_us": 13.0,
             "read_bw_gbps": 14.0,
@@ -194,17 +229,20 @@ def run_token_sweep() -> list[dict]:
     existing: list[dict] = []
     if path.exists():
         existing = json.loads(path.read_text())
+    for row in existing:
+        row.setdefault("mode", "window")
     have = {
-        (round(float(row["gpu_frac"]), 2), round(float(row["offered_qps"]), 2))
+        (row["mode"], round(float(row["gpu_frac"]), 2), round(float(row["offered_qps"]), 2))
         for row in existing
     }
     gpu_blocks = cache_gpu_blocks("LLaMa2-70B-GQA")
     rows = list(existing)
-    for gpu_frac in BENCH_FRACS:
-        tag = f"gfrac_{gpu_frac:.2f}".replace(".", "p")
-        cfg = write_cfg(HERE / f"{tag}.json", _payload(gpu_frac))
+    modes = (("window", "gfrac", 0), ("select", "gsel", WINDOW))
+    for (mode, prefix, select), gpu_frac in product(modes, BENCH_FRACS):
+        tag = f"{prefix}_{gpu_frac:.2f}".replace(".", "p")
+        cfg = write_cfg(HERE / f"{tag}.json", _payload(gpu_frac, select))
         for qps in BENCH_QPS_LIST:
-            key = (round(gpu_frac, 2), round(qps, 2))
+            key = (mode, round(gpu_frac, 2), round(qps, 2))
             if key in have:
                 print(f"  reuse {tag} qps={qps:g}", flush=True)
                 continue
@@ -212,6 +250,7 @@ def run_token_sweep() -> list[dict]:
             result = run_benchmark(HERE / tag, qps, cfg, model=MODEL)
             row = {
                 "tag": tag,
+                "mode": mode,
                 "gpu_frac": gpu_frac,
                 "ssd_frac": 1.0 - gpu_frac,
                 "peak_b": peak_b(
@@ -230,28 +269,36 @@ def run_token_sweep() -> list[dict]:
                 f"ssd_read={row['kv_ws_ssd_read_tokens']}",
                 flush=True,
             )
-    rows.sort(key=lambda row: (row["offered_qps"], -row["gpu_frac"]))
+    rows.sort(key=lambda row: (row["mode"], row["offered_qps"], -row["gpu_frac"]))
     path.write_text(json.dumps(rows, indent=2) + "\n")
     print(f"wrote {path}", flush=True)
     return rows
 
 
-def _rows_for_qps(rows: list[dict], qps: float) -> list[dict]:
-    matched = [row for row in rows if abs(float(row["offered_qps"]) - qps) < 1e-9]
+def _rows_for_qps(rows: list[dict], qps: float, mode: str = "window") -> list[dict]:
+    matched = [
+        row
+        for row in rows
+        if abs(float(row["offered_qps"]) - qps) < 1e-9
+        and row.get("mode", "window") == mode
+    ]
     matched.sort(key=lambda row: -row["gpu_frac"])
     return matched
 
 
 def plot_tokens(rows: list[dict], fetch_rows: list[dict]) -> None:
-    by_qps = {qps: _rows_for_qps(rows, qps) for qps in BENCH_QPS_LIST}
+    # (qps, mode) -> (color, marker, linestyle, label). window solid, select dotted.
     styles = {
-        0.08: ("#54a24b", "o", "offered 0.08"),
-        0.14: ("#4c78a8", "s", "offered 0.14"),
+        (0.08, "window"): ("#54a24b", "o", "-", "window256 @0.08"),
+        (0.14, "window"): ("#4c78a8", "s", "-", "window256 @0.14"),
+        (0.08, "select"): ("#54a24b", "o", ":", "select256 @0.08"),
+        (0.14, "select"): ("#4c78a8", "s", ":", "select256 @0.14"),
     }
+    by_key = {key: _rows_for_qps(rows, key[0], key[1]) for key in styles}
 
     fig, axes = plt.subplots(1, 2, figsize=(11.6, 4.4))
-    for qps, (color, marker, label) in styles.items():
-        series = by_qps[qps]
+    for key, (color, marker, ls, label) in styles.items():
+        series = by_key[key]
         if not series:
             continue
         xs = [r["gpu_frac"] * 100 for r in series]
@@ -260,6 +307,7 @@ def plot_tokens(rows: list[dict], fetch_rows: list[dict]) -> None:
             [r["output_token_ps"] for r in series],
             marker=marker,
             color=color,
+            linestyle=ls,
             linewidth=2,
             label=label,
         )
@@ -270,34 +318,39 @@ def plot_tokens(rows: list[dict], fetch_rows: list[dict]) -> None:
     axes[0].set_ylim(0, 650)
     axes[0].legend(fontsize=8)
 
-    series_08 = by_qps[0.08]
-    xs = [r["gpu_frac"] * 100 for r in series_08]
-    axes[1].plot(
-        xs,
-        [r["tpot_p50"] * 1e3 for r in series_08],
-        marker="o",
-        color="#c45c26",
-        linewidth=2,
-        label="TPOT p50 @0.08",
-    )
     ax2 = axes[1].twinx()
-    ax2.plot(
-        xs,
-        [r["kv_ws_ssd_read_tokens"] / 1e6 for r in series_08],
-        marker="s",
-        color="#4c78a8",
-        linewidth=1.6,
-        label="SSD read tokens (M)",
-    )
+    for mode, ls in (("window", "-"), ("select", ":")):
+        series_08 = by_key[(0.08, mode)]
+        if not series_08:
+            continue
+        xs = [r["gpu_frac"] * 100 for r in series_08]
+        axes[1].plot(
+            xs,
+            [r["tpot_p50"] * 1e3 for r in series_08],
+            marker="o",
+            color="#c45c26",
+            linestyle=ls,
+            linewidth=2,
+            label=f"TPOT p50 {mode}256 @0.08",
+        )
+        ax2.plot(
+            xs,
+            [r["kv_ws_ssd_read_tokens"] / 1e6 for r in series_08],
+            marker="s",
+            color="#4c78a8",
+            linestyle=ls,
+            linewidth=1.6,
+            label=f"SSD read tokens (M) {mode}256",
+        )
     axes[1].set_xlabel("gpu_frac (%)")
     axes[1].set_ylabel("TPOT p50 (ms)", color="#c45c26")
     ax2.set_ylabel("SSD read tokens (M)", color="#4c78a8")
-    axes[1].set_title("TPOT and measured SSD reads")
+    axes[1].set_title("TPOT and measured SSD reads (offered 0.08)")
     axes[1].set_xlim(31, 3)
     axes[1].spines["right"].set_visible(True)
     lines = axes[1].get_lines() + ax2.get_lines()
-    axes[1].legend(lines, [line.get_label() for line in lines], fontsize=8)
-    fig.suptitle("Sparse offload, dram_frac=0 — system throughput")
+    axes[1].legend(lines, [line.get_label() for line in lines], fontsize=7)
+    fig.suptitle("Sparse offload, dram_frac=0 — solid: window256, dotted: uniform select256")
     fig.tight_layout()
     path = HERE / "fig_gpu_frac_tokens.png"
     fig.savefig(path, dpi=160, bbox_inches="tight")
@@ -305,13 +358,15 @@ def plot_tokens(rows: list[dict], fetch_rows: list[dict]) -> None:
     print("wrote", path)
 
     fig, axes = plt.subplots(1, 2, figsize=(11.6, 4.4))
-    for qps, (color, marker, label) in styles.items():
-        series = by_qps[qps]
+    for key, (color, marker, ls, label) in styles.items():
+        series = by_key[key]
         if not series:
             continue
         xs = [r["gpu_frac"] * 100 for r in series]
         speed = [1.0 / r["tpot_p50"] for r in series]
-        axes[0].plot(xs, speed, marker=marker, color=color, linewidth=2, label=label)
+        axes[0].plot(
+            xs, speed, marker=marker, color=color, linestyle=ls, linewidth=2, label=label
+        )
     axes[0].set_xlabel("gpu_frac (%)")
     axes[0].set_ylabel("decode token/s per request  (1 / TPOT)")
     axes[0].set_title("Measured per-request decode speed")
@@ -332,6 +387,22 @@ def plot_tokens(rows: list[dict], fetch_rows: list[dict]) -> None:
         color="#e45756",
         linewidth=2,
         label="S=4096  1000/(59.22ms+fetch)",
+    )
+    axes[1].plot(
+        fx,
+        [1000.0 / (ROOFLINE_STEP_MS + r["prefill_select_fetch_ms"]) for r in fetch_rows],
+        color="#4c78a8",
+        linestyle=":",
+        linewidth=2,
+        label="select256 S=2048",
+    )
+    axes[1].plot(
+        fx,
+        [1000.0 / (ROOFLINE_STEP_MS + r["end_select_fetch_ms"]) for r in fetch_rows],
+        color="#e45756",
+        linestyle=":",
+        linewidth=2,
+        label="select256 S=4096",
     )
     axes[1].axvline(12.5, color="#4c78a8", linestyle="--", linewidth=1, alpha=0.7)
     axes[1].axvline(6.25, color="#e45756", linestyle="--", linewidth=1, alpha=0.7)

@@ -245,7 +245,7 @@
     "recomputation_count": 7,
     "recomputed_tokens": 17006,
     "recompute_service_time": 2.4722255952101637,
-    "simulator_wall_time": 3.0243292339873733,
+    "simulator_wall_time": 3.1490096150082536,
     "simulated_time": 14289.046413841812,
     "reuse_hit_blocks": 0,
     "reuse_miss_blocks": 0,

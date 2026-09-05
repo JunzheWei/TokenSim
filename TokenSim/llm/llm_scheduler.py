@@ -165,6 +165,7 @@ class LLMPagedAttnScheduler(LLMScheduler):
         sink_tokens: int = 0,
         window_tokens: int = 0,
         streaming_attention: bool = False,
+        cache_tokens: int = 0,
     ):
         super().__init__(connector=connector)
 
@@ -181,6 +182,7 @@ class LLMPagedAttnScheduler(LLMScheduler):
             sink_tokens=sink_tokens,
             window_tokens=window_tokens,
             streaming_attention=streaming_attention,
+            cache_tokens=cache_tokens,
         )
 
         self.max_occupy_ratio = max_occupy_ratio

@@ -34,10 +34,18 @@ def retained_tokens(
 
 
 def attention_tokens(context_len: int, config: WorkingSetConfig) -> int:
-    """Decode attention tokens. Sparse+offload and StreamingLLM use sink ∪ window."""
-    if config.streaming_attention or config.sparse:
+    """Decode attention tokens.
+
+    StreamingLLM: sink ∪ window. Sparse+offload: sink ∪ window, or
+    sink ∪ top-k when ``select_tokens`` is set.
+    """
+    if config.streaming_attention:
         return retained_tokens(
             context_len, config.sink_tokens, config.window_tokens
+        )
+    if config.sparse:
+        return retained_tokens(
+            context_len, config.sink_tokens, config.attended_span()
         )
     return max(0, int(context_len))
 
@@ -48,18 +56,22 @@ def gpu_resident_tokens(
     sink_tokens: int = 0,
     window_tokens: int = 0,
     streaming_attention: bool = False,
+    cache_tokens: int = 0,
 ) -> int:
-    """GPU-resident tokens; matches ``split_context`` GPU count."""
+    """GPU-resident tokens: ``split_context`` GPU count plus the selection
+    page cache (``cache_tokens``, bounded by the cold hole)."""
     if streaming_attention:
         return retained_tokens(context_len, sink_tokens, window_tokens)
     context_len = max(0, int(context_len))
     tail = floor(context_len * gpu_frac)
     sink = min(max(0, int(sink_tokens)), context_len)
     if sink == 0:
-        return tail
-    if sink + tail >= context_len:
-        return context_len
-    return sink + tail
+        resident = tail
+    elif sink + tail >= context_len:
+        resident = context_len
+    else:
+        resident = sink + tail
+    return min(context_len, resident + max(0, int(cache_tokens)))
 
 
 def gpu_resident_blocks(
@@ -69,6 +81,7 @@ def gpu_resident_blocks(
     sink_tokens: int = 0,
     window_tokens: int = 0,
     streaming_attention: bool = False,
+    cache_tokens: int = 0,
 ) -> int:
     """GPU KV blocks charged for ``context_len`` tokens at ``gpu_frac``."""
     if block_size <= 0:
@@ -79,6 +92,7 @@ def gpu_resident_blocks(
         sink_tokens,
         window_tokens,
         streaming_attention,
+        cache_tokens,
     )
     if tokens <= 0:
         return 0

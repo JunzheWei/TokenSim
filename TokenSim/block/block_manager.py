@@ -132,6 +132,7 @@ class BlockManager:
         sink_tokens: int = 0,
         window_tokens: int = 0,
         streaming_attention: bool = False,
+        cache_tokens: int = 0,
     ):
         self.block_size = block_size
         self.num_total_gpu_blocks = num_gpu_blocks
@@ -140,6 +141,7 @@ class BlockManager:
         self.sink_tokens = max(0, int(sink_tokens))
         self.window_tokens = max(0, int(window_tokens))
         self.streaming_attention = bool(streaming_attention)
+        self.cache_tokens = max(0, int(cache_tokens))
 
         self.block_table = BlockTable()
         self.kv_cache_manager = KVCacheManager(block_size=block_size, model=model)
@@ -173,12 +175,13 @@ class BlockManager:
             if tokens <= 0 or self.block_size <= 0:
                 return 0
             return (tokens + self.block_size - 1) // self.block_size
-        sink = 0 if self._occupancy_frac(req) >= 1.0 else self.sink_tokens
+        decode = self._occupancy_frac(req) < 1.0
         return gpu_resident_blocks(
             req.context_len,
             self.block_size,
             self._occupancy_frac(req),
-            sink,
+            self.sink_tokens if decode else 0,
+            cache_tokens=self.cache_tokens if decode else 0,
         )
 
     def can_allocate(self, req: Request) -> bool:

@@ -142,6 +142,31 @@ def _overlap(start_a: int, end_a: int, start_b: int, end_b: int) -> int:
     return max(0, min(end_a, end_b) - max(start_a, start_b))
 
 
+def _selected_cold_tokens(
+    split: ContextSplit,
+    select_tokens: int,
+    cache_tokens: int = 0,
+    reuse: float = 0.0,
+) -> tuple[int, int]:
+    """Expected (dram, ssd) tokens of a uniform top-k selection that miss GPU.
+
+    With a GPU page cache of ``cache_tokens`` and step-to-step ``reuse``,
+    the cold hit ratio is ``reuse + (1 - reuse) × min(1, cache / cold)``:
+    repeated pages were fetched last step and sit in the cache; fresh
+    uniform draws hit with the cache's share of the cold set.
+    """
+    live = split.context_len - split.sink
+    cold = split.dram + split.ssd
+    if live <= 0 or cold <= 0:
+        return 0, 0
+    k = min(max(0, int(select_tokens)), live)
+    cold_selected = k * cold / live
+    hit = reuse + (1.0 - reuse) * min(1.0, max(0, int(cache_tokens)) / cold)
+    cold_missed = round(cold_selected * (1.0 - hit))
+    dram_tokens = round(cold_missed * split.dram / cold)
+    return dram_tokens, cold_missed - dram_tokens
+
+
 def fetch_cost(
     context_len: int,
     config: WorkingSetConfig,
@@ -151,7 +176,11 @@ def fetch_cost(
 
     Default: the whole cold set ``[0, gpu_start)``. With ``config.sparse``,
     only ``window ∩ cold`` (the attended set that misses GPU); sink is
-    GPU-resident and is not reread. StreamingLLM eviction
+    GPU-resident and is not reread. With ``select_tokens`` the attended set
+    is k tokens drawn uniformly from the non-sink context, so the expected
+    cold share ``k × cold / (S - sink)`` is fetched, split across DRAM/SSD
+    in proportion to their share of the cold set; ``select_cache_tokens`` /
+    ``select_reuse`` reduce it by the page-cache hit ratio. StreamingLLM eviction
     (``streaming_attention``) has no cold set.
     """
     if config.streaming_attention:
@@ -166,17 +195,25 @@ def fetch_cost(
         )
     split = split_context(context_len, config)
     size_per_token = max(0, int(size_per_token))
-    if config.sparse:
-        window = max(0, int(config.window_tokens))
-        win_start = max(0, context_len - window)
-        cold_start = split.sink
+    if config.sparse and config.select_tokens > 0:
+        dram_tokens, ssd_tokens = _selected_cold_tokens(
+            split,
+            config.select_tokens,
+            config.select_cache_tokens,
+            config.select_reuse,
+        )
     else:
-        win_start = 0
-        cold_start = 0
-    miss_start = max(win_start, cold_start)
-    miss_end = split.gpu_start
-    dram_tokens = _overlap(miss_start, miss_end, split.dram_start, split.gpu_start)
-    ssd_tokens = _overlap(miss_start, miss_end, split.ssd_start, split.dram_start)
+        if config.sparse:
+            window = max(0, int(config.window_tokens))
+            win_start = max(0, context_len - window)
+            cold_start = split.sink
+        else:
+            win_start = 0
+            cold_start = 0
+        miss_start = max(win_start, cold_start)
+        miss_end = split.gpu_start
+        dram_tokens = _overlap(miss_start, miss_end, split.dram_start, split.gpu_start)
+        ssd_tokens = _overlap(miss_start, miss_end, split.ssd_start, split.dram_start)
     dram_bytes = dram_tokens * size_per_token
     ssd_bytes = ssd_tokens * size_per_token
     dram_ios = media_n_ios(dram_bytes, config.dram)
