@@ -39,6 +39,10 @@ SINK = 4
 WINDOW = 256
 LATENCIES_US = (13, 25, 50, 100)
 OVERLAPS = ("layer_prefetch", "blocking")
+# Same 4K / 14 GB/s / qd_cap=64 as the main recipe; only media latency changes.
+# N3X SLC = current arms (13 µs). N3 = 50 µs (data/kv_working_set/hier_n3.json).
+N3X_SLC_US = 13.0
+N3_US = 50.0
 
 
 def _peak_fields(gpu_frac: float, *, streaming: bool = False) -> dict:
@@ -111,6 +115,38 @@ def _select_extra(cache_tokens: int, reuse: float) -> dict:
     }
 
 
+def _drive_arms() -> tuple[tuple[str, Path, dict], ...]:
+    return (
+        ("hier_full", HIER_FULL, {"gpu_frac": 0.3, "dram_frac": 0.0, "ssd_frac": 0.7}),
+        (
+            "sparse_offload",
+            HIER_SPARSE,
+            {
+                "gpu_frac": 0.3,
+                "dram_frac": 0.0,
+                "ssd_frac": 0.7,
+                "sparse": True,
+                "sink_tokens": SINK,
+                "window_tokens": WINDOW,
+            },
+        ),
+        (
+            "select_offload",
+            HIER_SELECT,
+            {
+                "gpu_frac": 0.3,
+                "dram_frac": 0.0,
+                "ssd_frac": 0.7,
+                "sparse": True,
+                "sink_tokens": SINK,
+                "window_tokens": WINDOW,
+                "select_tokens": WINDOW,
+            },
+        ),
+        ("cache_offload", HIER_CACHE, _select_extra(512, 0.0)),
+    )
+
+
 def run_knees() -> list[dict]:
     print(f"GQA gpu_blocks={GPU_BLOCKS} context={CONTEXT}", flush=True)
     all_gpu = _reuse_knee("all_gpu", {"gpu_frac": 1.0})
@@ -173,6 +209,66 @@ def run_cache_grid() -> list[dict]:
     return rows
 
 
+def _n3_payload(src: Path) -> dict:
+    payload = json.loads(src.read_text())
+    payload["ssd"]["read_latency_us"] = N3_US
+    payload["ssd"].pop("write_latency_us", None)
+    return payload
+
+
+def run_drive_compare() -> list[dict]:
+    """N3 (50 µs) vs already-measured N3X SLC (13 µs); IO size and BW held fixed."""
+    print("=== N3 vs N3X SLC (4K, qd_cap=64, 14 GB/s) ===", flush=True)
+    slc_rows = {row["tag"]: row for row in json.loads((OUT / "summary.json").read_text())}
+    rows = []
+    for tag, src, extra in _drive_arms():
+        slc = slc_rows[tag]
+        n3_tag = f"n3_{tag}"
+        cfg_path = write_cfg(OUT / f"{n3_tag}.json", _n3_payload(src))
+        n3 = _knee_row(n3_tag, cfg_path, extra)
+        rows.append(
+            {
+                "arm": tag,
+                "n3x_slc": {
+                    "tag": tag,
+                    "read_latency_us": N3X_SLC_US,
+                    "qps_star": slc["qps_star"],
+                    "n_star": slc["n_star"],
+                    "output_token_ps": slc["output_token_ps"],
+                    "tpot_p50": slc["tpot_p50"],
+                    "tpot_p99": slc["tpot_p99"],
+                    "ttft_p50": slc["ttft_p50"],
+                    "ttft_p99": slc["ttft_p99"],
+                    "kv_ws_ssd_read_tokens": slc["kv_ws_ssd_read_tokens"],
+                    "kv_ws_fetch_latency": slc["kv_ws_fetch_latency"],
+                    "curve": slc["curve"],
+                },
+                "n3": {
+                    "tag": n3_tag,
+                    "read_latency_us": N3_US,
+                    "qps_star": n3["qps_star"],
+                    "n_star": n3["n_star"],
+                    "output_token_ps": n3["output_token_ps"],
+                    "tpot_p50": n3["tpot_p50"],
+                    "tpot_p99": n3["tpot_p99"],
+                    "ttft_p50": n3["ttft_p50"],
+                    "ttft_p99": n3["ttft_p99"],
+                    "kv_ws_ssd_read_tokens": n3["kv_ws_ssd_read_tokens"],
+                    "kv_ws_fetch_latency": n3["kv_ws_fetch_latency"],
+                    "curve": n3["curve"],
+                },
+            }
+        )
+        print(
+            f"  {tag}: SLC λ*={slc['qps_star']:.2f} {slc['output_token_ps']:.1f} tok/s "
+            f"vs N3 λ*={n3['qps_star']:.2f} {n3['output_token_ps']:.1f} tok/s",
+            flush=True,
+        )
+    (OUT / "drive_compare.json").write_text(json.dumps(rows, indent=2) + "\n")
+    print(f"wrote {OUT / 'drive_compare.json'}", flush=True)
+    return rows
+
+
 def run_latency_sweep(hier_full_qps: float) -> list[dict]:
     existing = OUT / "latency_summary.json"
     print(f"=== latency sweep offered_qps={hier_full_qps:g} ===", flush=True)
@@ -209,10 +305,15 @@ def run_latency_sweep(hier_full_qps: float) -> list[dict]:
 
 
 def main() -> int:
+    drive_only = "--drive-only" in sys.argv
+    if drive_only:
+        run_drive_compare()
+        return 0
     knees = run_knees()
     run_cache_grid()
     hier_full = next(row for row in knees if row["tag"] == "hier_full")
     run_latency_sweep(float(hier_full["qps_star"]))
+    run_drive_compare()
     return 0
 
 
